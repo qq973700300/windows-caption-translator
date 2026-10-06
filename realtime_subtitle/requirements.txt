@@ -1,0 +1,6 @@
+faster-whisper
+soundcard
+deep-translator
+pyttsx3
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

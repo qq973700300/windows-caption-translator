@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# 运行时产物（config.json 可能含 API Key，不要提交）
+config.json
+*.log
+subtitle.log
+
+# 测试音频
+*.wav
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地工具数据
+.workbuddy/
