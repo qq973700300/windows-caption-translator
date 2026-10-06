@@ -18,6 +18,9 @@ subtitle.log
 build/
 dist/
 *.spec
+*.zip
+# 打包配置本身要提交（注释必须独占一行，gitignore 不支持行尾注释）
+!build_exe.spec
 
 # 编辑器 / 系统
 .vscode/

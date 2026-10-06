@@ -12,9 +12,21 @@
 
 ---
 
-## 一、快速开始（3 步跑起来）
+## 一、快速开始
 
-### 1. 安装依赖
+### 方式 A：下载打包版（免装 Python，推荐）
+
+1. 到 [Releases](https://github.com/qq973700300/windows-caption-translator/releases) 下载 `SubtitleTranslator_v2.0.0.zip`
+2. 解压到任意文件夹（建议路径不要含中文）
+3. 双击 **`SubtitleTranslator.exe`** → 点「▶ 开始翻译」
+
+> - 体积约 **250MB**（Python 运行时 + 识别引擎），**不含** CUDA 运行库与识别模型
+> - **识别模型首次运行时自动下载**（约 100~500MB，走国内镜像），之后缓存在本地
+> - 打包版运行在 CPU（识别 0.6~0.8 秒，日常够用）；**要 GPU 加速请用方式 B**
+
+### 方式 B：源码运行（支持 GPU 加速）
+
+#### 1. 安装依赖
 
 双击 **`install.bat`** 即可（自动创建 `.venv`、安装依赖、预下载识别模型）。
 
@@ -27,7 +39,7 @@ python -m venv .venv
 
 > 有 NVIDIA 显卡时安装脚本会自动装 CUDA 运行库（`nvidia-cublas-cu12` / `nvidia-cudnn-cu12`），识别速度更快。
 
-### 2. 启动
+#### 2. 启动
 
 双击 **`run.bat`** → 弹出控制面板。
 
@@ -52,7 +64,7 @@ python -m venv .venv
 | 选项 | 作用 | 推荐值 |
 |---|---|---|
 | **识别模型** | 精度与速度的权衡 | `base（快，约 0.6s）` 追低延迟；`small（推荐，约 1.6s）` 平衡；`medium` 精度最高但慢 |
-| **运行设备** | 用显卡还是 CPU 做识别 | `自动（优先 GPU）`。GPU 首次初始化约 8 秒；显卡被其他程序占满时可在界面看到提示，改选 CPU 即可 |
+| **运行设备** | 用显卡还是 CPU 做识别 | `自动（优先 GPU）`。GPU 首次初始化约 8 秒；显卡被其他程序占满时可在界面看到提示，改选 CPU 即可。**打包版无 CUDA 运行库，会自动回退到 CPU** |
 | **音频来源** | 采集哪个输出设备的声音 | 默认「系统默认输出设备」。**用耳机看视频时必须切换到耳机设备**，否则抓不到声音 |
 | **视频语言** | 指定源语言可提升识别准确率 | `自动检测`；明确知道时选 `英语 / 日语 / 韩语` 等更准 |
 | **翻译引擎** | 中文翻译走哪个通道 | `自动（免费在线回退链）`：腾讯 Transmart → MyMemory → Google 依次回退；也有 `LLM API`（OpenAI 兼容接口，质量更好，需填 Key） |
@@ -80,7 +92,7 @@ python -m venv .venv
 | **句首第一个词被吃掉** | 语音起始判定丢帧 | 已用预卷缓冲修复；如仍出现请反馈 |
 | **GPU 报错 / 卡住** | 缺 CUDA 运行库，或显存被占满 | 跑 `install.bat` 补装运行库；或在「运行设备」改选 CPU |
 
-运行日志在 `realtime_subtitle\subtitle.log`，配置保存在 `realtime_subtitle\config.json`。
+运行日志与配置保存在**程序所在目录**下（`subtitle.log` / `config.json`）；源码运行时在 `realtime_subtitle\` 目录。
 
 ---
 
@@ -119,6 +131,7 @@ python -m venv .venv
 ├─ run.bat                 启动（GUI，无控制台）
 ├─ run_debug.bat           启动（带控制台，排错用）
 ├─ install.bat             一键重建环境 + 装依赖 + 下载模型
+├─ build_exe.spec          PyInstaller 打包配置（CPU 精简版）
 └─ realtime_subtitle/
    ├─ main.py              控制面板 + 悬浮字幕窗
    ├─ capture.py           系统声音采集 + VAD 切句
@@ -138,6 +151,28 @@ python -m venv .venv
 | `test_sentences.py` | 真实声卡端到端：4 句话 + 背景音乐，验证逐句出字幕 |
 | `test_realtime.py` | 实时性测试：记录字幕出现的时间线 |
 | `bench_speed.py` / `bench_gpu.py` | 识别速度与 GPU/CPU 对比基准 |
+
+---
+
+## 自行打包 exe
+
+需要重打打包版时（改了代码之后）：
+
+```bash
+.venv\Scripts\pip install pyinstaller
+.venv\Scripts\python -m PyInstaller build_exe.spec --noconfirm --clean
+```
+
+产物在 `dist\SubtitleTranslator\`，约 250MB，压缩后约 100MB。
+
+打包策略（见 `build_exe.spec`）：
+
+| 处理 | 说明 |
+|---|---|
+| 排除 `nvidia` / `torch` / `scipy` 等 | CUDA 运行库合计约 2GB，全打进去会撑爆 GitHub 单文件 2GB 限制 |
+| 不打包 Whisper 模型 | 首次运行按需下载到用户缓存，避免体积翻倍 |
+| `console=False` | GUI 程序不弹控制台，运行日志写 `subtitle.log` |
+| 冻结后路径修正 | `main.py` 检测 `sys.frozen`，把 `config.json` / `subtitle.log` 落在 exe 同级目录而非临时目录 |
 
 ---
 

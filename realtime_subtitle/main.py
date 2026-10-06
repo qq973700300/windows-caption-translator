@@ -16,16 +16,28 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 模块目录：始终指向代码所在位置（打包后为 _MEIPASS 内部）
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 数据目录：源码运行=代码目录；打包后=exe 同级目录（保证配置/日志可持久保存）
+BASE_DIR = (os.path.dirname(sys.executable)
+            if getattr(sys, "frozen", False) else _MODULE_DIR)
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOG_PATH = os.path.join(BASE_DIR, "subtitle.log")
 
-sys.path.insert(0, BASE_DIR)
+sys.path.insert(0, _MODULE_DIR)
+
+# 日志落盘；若目录不可写（如装在 Program Files）则退到临时目录，不阻断启动
+try:
+    _log_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+except Exception:
+    import tempfile
+    LOG_PATH = os.path.join(tempfile.gettempdir(), "subtitle.log")
+    _log_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")],
+    handlers=[_log_handler],
 )
 log = logging.getLogger("subtitle")
 
