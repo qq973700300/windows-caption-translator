@@ -1,19 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-实时视频翻译字幕
-- 捕获系统播放的声音（loopback）
-- faster-whisper 本地识别
-- 翻译成中文
-- 置顶悬浮字幕窗显示
+实时视频翻译字幕（流式方案）
+
+链路：系统声音 loopback 采集 -> Silero VAD 切句 -> 流式 Paraformer 增量识别
+      -> LocalAgreement 定稿 -> 翻译 -> 固定尺寸悬浮字幕窗
+
+已移除的旧方案（不再保留回退）：
+  - 能量阈值 VAD（对背景音乐敏感）-> 统一 Silero VAD
+  - Whisper 整段识别（必须攒够音频再整段重跑，延迟高）-> 统一流式 Paraformer
 """
 import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
 # 模块目录：始终指向代码所在位置（打包后为 _MEIPASS 内部）
@@ -25,6 +30,8 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOG_PATH = os.path.join(BASE_DIR, "subtitle.log")
 
 sys.path.insert(0, _MODULE_DIR)
+
+from textutil import group_pieces, looks_chinese, is_garbage  # noqa: E402
 
 # 日志落盘；若目录不可写（如装在 Program Files）则退到临时目录，不阻断启动
 try:
@@ -44,13 +51,11 @@ log = logging.getLogger("subtitle")
 # ---------------------------------------------------------------------------
 # 配置
 DEFAULT_CONFIG = {
-    "model_size": "small",            # tiny / base / small / medium
     "source_lang": "auto",            # auto / en / ja / ko / zh / ru ...
     "translate_engine": "auto",       # auto / google / mymemory / llm
     "sensitivity": 1.0,               # 0.5 - 3.0，越大越灵敏
     "device_id": "",                  # 音频输出设备（空 = 系统默认）
-    "compute_device": "auto",         # 识别运算设备：auto / cuda / cpu
-    "preview": True,                  # 实时预览：边说边出字幕（低延迟）
+    "preview": True,                  # 边说边出字幕（关闭则整句说完才显示）
     "subtitle_x": -1,                 # 字幕窗位置（-1 居中）
     "subtitle_y": -1,
     "llm_base_url": "",
@@ -69,6 +74,9 @@ def load_config():
             cfg.update(json.load(f))
     except Exception:
         pass
+    # 清理已废弃的旧方案配置项
+    for dead in ("model_size", "compute_device", "vad_engine", "asr_engine"):
+        cfg.pop(dead, None)
     return cfg
 
 
@@ -91,20 +99,73 @@ LANGS = {
     "德语": "de",
     "西班牙语": "es",
 }
-MODELS = {"tiny (最快/精度低)": "tiny", "base (快, 延迟约0.6s)": "base",
-          "small (推荐, 延迟约1.6s)": "small", "medium (慢/精度高)": "medium"}
 ENGINES = {"自动（免费在线回退链）": "auto", "Google 翻译": "google",
            "MyMemory": "mymemory", "LLM API (OpenAI兼容)": "llm"}
-DEVICES = {"自动（优先GPU）": "auto", "GPU (CUDA)": "cuda", "CPU": "cpu"}
-DEVICES_INV = {v: k for k, v in DEVICES.items()}
-MODELS_INV = {v: k for k, v in MODELS.items()}
 
 SUB_DURATION = 9.0  # 字幕停留秒数
+
+# ---------------------------------------------------------------------------
+# 字幕窗尺寸（固定，不随文本长短变化）
+SUB_WIDTH = 760
+SRC_LINES = 1        # 原文固定 1 行
+DST_LINES = 2        # 译文固定 2 行
+SRC_FONT = ("Microsoft YaHei UI", 12)
+DST_FONT = ("Microsoft YaHei UI", 17, "bold")
+
+_CJK_RE = re.compile(
+    r"[\u3000-\u303f\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\uff00-\uffef]")
+
+
+def _tokenize(s):
+    """切成折行用的最小单位：CJK 按字，西文按词"""
+    tokens, buf = [], ""
+    for ch in s:
+        if _CJK_RE.match(ch):
+            if buf:
+                tokens.append(buf)
+                buf = ""
+            tokens.append(ch)
+        elif ch.isspace():
+            if buf:
+                tokens.append(buf)
+                buf = ""
+            tokens.append(" ")
+        else:
+            buf += ch
+    if buf:
+        tokens.append(buf)
+    return tokens
+
+
+def fit_lines(text, font, max_px, n_lines):
+    """把文本折行并规整成恰好 n_lines 行
+
+    - 放不下时保留**最后** n_lines 行（字幕要留最新内容），首行加 …
+    - 不足 n_lines 行时在前面补空行（顶部对齐），保证框体高度恒定
+    """
+    lines, cur = [], ""
+    for tok in _tokenize(text or ""):
+        if tok == " " and not cur:
+            continue
+        probe = cur + tok
+        if cur and font.measure(probe.rstrip()) > max_px:
+            lines.append(cur.rstrip())
+            cur = "" if tok == " " else tok
+        else:
+            cur = probe
+    if cur.strip():
+        lines.append(cur.rstrip())
+    if len(lines) > n_lines:                 # 超长：保留最新的几行
+        lines = lines[-n_lines:]
+        lines[0] = "…" + lines[0].lstrip()
+    elif len(lines) < n_lines:               # 不足：在后面补空行，内容始终顶在第一行
+        lines = lines + [""] * (n_lines - len(lines))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 class SubtitleOverlay(tk.Toplevel):
-    """置顶半透明悬浮字幕窗（无边框、可拖动）"""
+    """置顶半透明悬浮字幕窗（无边框、可拖动、尺寸固定）"""
 
     def __init__(self, master, x, y):
         super().__init__(master)
@@ -112,21 +173,34 @@ class SubtitleOverlay(tk.Toplevel):
         self.attributes("-topmost", True)
         self.attributes("-alpha", 0.82)
         self.configure(bg="#101014")
+        self.pack_propagate(False)      # 内容再多也不撑大窗口
 
-        w = 760
+        self._src_f = tkfont.Font(family=SRC_FONT[0], size=SRC_FONT[1])
+        self._dst_f = tkfont.Font(family=DST_FONT[0], size=DST_FONT[1],
+                                  weight="bold")
+        wrap = SUB_WIDTH - 40
+
         self.src_label = tk.Label(
-            self, text="", font=("Microsoft YaHei UI", 12),
-            fg="#c8c8c8", bg="#101014", wraplength=w - 40, justify="left")
-        self.src_label.pack(padx=20, pady=(10, 0), anchor="w")
+            self, text="", font=self._src_f, fg="#c8c8c8", bg="#101014",
+            wraplength=wrap, justify="left", anchor="nw", height=SRC_LINES)
+        self.src_label.pack(padx=20, pady=(10, 0), fill="x")
         self.dst_label = tk.Label(
-            self, text="", font=("Microsoft YaHei UI", 17, "bold"),
-            fg="#ffd54a", bg="#101014", wraplength=w - 40, justify="left")
-        self.dst_label.pack(padx=20, pady=(2, 10), anchor="w")
+            self, text="", font=self._dst_f, fg="#ffd54a", bg="#101014",
+            wraplength=wrap, justify="left", anchor="nw", height=DST_LINES)
+        self.dst_label.pack(padx=20, pady=(2, 10), fill="x")
 
         # 关闭/拖动小提示条（右下角）
         tip = tk.Label(self, text="按住拖动 | 双击关闭", font=("Microsoft YaHei UI", 8),
                        fg="#666670", bg="#101014")
         tip.pack(side="bottom", anchor="e", padx=8, pady=2)
+
+        # 高度按固定行数算死：内容长短变化时窗口不跳动
+        padding = 10 + 2 + 10 + 4          # 各行 pack 的上下留白
+        tip_line = self._src_f.metrics("linespace")   # 提示条约一行高
+        h = (padding + SRC_LINES * self._src_f.metrics("linespace")
+             + DST_LINES * self._dst_f.metrics("linespace") + tip_line + 6)
+        self._h = int(h)
+        self.geometry(f"{SUB_WIDTH}x{self._h}")
 
         self._dx = self._dy = 0
         for widget in (self, self.src_label, self.dst_label):
@@ -141,7 +215,7 @@ class SubtitleOverlay(tk.Toplevel):
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
             self.update_idletasks()
-            self.geometry(f"+{(sw - w) // 2}+{sh - 180}")
+            self.geometry(f"+{(sw - SUB_WIDTH) // 2}+{sh - self._h - 60}")
 
     def _on_press(self, e):
         self._dx = e.x
@@ -152,15 +226,20 @@ class SubtitleOverlay(tk.Toplevel):
 
     def set_subtitle(self, src, dst, partial=False):
         # partial：边说边出的实时预览，末尾加 … 且颜色略淡，成句后会被完整版替换
-        self.src_label.config(text=src + ("  …" if partial else ""),
-                              fg="#a8a8b0" if partial else "#c8c8c8")
-        self.dst_label.config(text=dst if dst else "",
-                              fg="#ffe9a8" if partial else "#ffd54a")
+        self.src_label.config(
+            text=fit_lines(src + ("  …" if partial else ""), self._src_f,
+                           SUB_WIDTH - 40, SRC_LINES),
+            fg="#a8a8b0" if partial else "#c8c8c8")
+        self.dst_label.config(
+            text=fit_lines(dst if dst else "", self._dst_f,
+                           SUB_WIDTH - 40, DST_LINES),
+            fg="#ffe9a8" if partial else "#ffd54a")
         self.deiconify()
 
     def clear(self):
-        self.src_label.config(text="")
-        self.dst_label.config(text="")
+        # 清空也保持同样的行数，框体尺寸不变
+        self.src_label.config(text="\n" * (SRC_LINES - 1), fg="#c8c8c8")
+        self.dst_label.config(text="\n" * (DST_LINES - 1), fg="#ffd54a")
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +247,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("实时视频翻译字幕")
-        self.geometry("480x640")
+        self.geometry("480x560")
         self.resizable(False, False)
         self.configure(bg="#f5f5f7")
         self._load_font_fallback()
@@ -177,7 +256,7 @@ class App(tk.Tk):
         self.overlay = None
         self.segmenter = None
         self.worker = None
-        self.seg_queue = queue.Queue(maxsize=8)
+        self.stream_queue = queue.Queue(maxsize=256)
         self.disp_queue = queue.Queue()
         self.running = False
         self._last_sub_time = 0
@@ -217,7 +296,7 @@ class App(tk.Tk):
 
         self.preview_var = tk.BooleanVar(value=bool(self.cfg.get("preview", True)))
         ttk.Checkbutton(
-            frm, text="实时预览（边说边出字幕，关闭则整句识别后再显示）",
+            frm, text="实时预览（边说边出字幕，关闭则整句说完再显示）",
             variable=self.preview_var,
             command=self._save_now).pack(anchor="w", **pad)
 
@@ -231,27 +310,21 @@ class App(tk.Tk):
         self.device_cb = ttk.Combobox(gridf, state="readonly", values=["加载中..."])
         rows = [
             ("音频来源", self.device_cb),
-            ("运行设备", ttk.Combobox(gridf, state="readonly",
-                          values=list(DEVICES.keys()))),
-            ("识别模型", ttk.Combobox(gridf, state="readonly",
-                          values=list(MODELS.keys()))),
             ("视频语言", ttk.Combobox(gridf, state="readonly",
                           values=list(LANGS.keys()))),
             ("翻译引擎", ttk.Combobox(gridf, state="readonly",
                           values=list(ENGINES.keys()))),
         ]
-        self.dev_cb = rows[1][1]
-        self.model_cb, self.lang_cb, self.eng_cb = rows[2][1], rows[3][1], rows[4][1]
+        self.lang_cb, self.eng_cb = rows[1][1], rows[2][1]
         for i, (label, cb) in enumerate(rows):
             ttk.Label(gridf, text=label).grid(row=i, column=0, sticky="e", padx=6, pady=4)
             cb.grid(row=i, column=1, sticky="we", padx=6, pady=4)
             cb.bind("<<ComboboxSelected>>", lambda e: self._save_now())
         gridf.columnconfigure(1, weight=1)
 
-        self.model_cb.set(self._key_of(MODELS, self.cfg["model_size"]))
         self.lang_cb.set(self._key_of(LANGS, self.cfg["source_lang"]))
         self.eng_cb.set(self._key_of(ENGINES, self.cfg["translate_engine"]))
-        self.dev_cb.set(self._key_of(DEVICES, self.cfg.get("compute_device", "auto")))
+
         # LLM 配置
         llmf = ttk.LabelFrame(frm, text=" LLM 翻译（可选，OpenAI 兼容接口，填好后选择对应引擎） ")
         llmf.pack(fill="x", **pad)
@@ -310,11 +383,9 @@ class App(tk.Tk):
         return list(mapping.keys())[0]
 
     def _collect_cfg(self):
-        self.cfg["model_size"] = MODELS.get(self.model_cb.get(), "small")
         self.cfg["source_lang"] = LANGS.get(self.lang_cb.get(), "auto")
         self.cfg["translate_engine"] = ENGINES.get(self.eng_cb.get(), "auto")
         self.cfg["sensitivity"] = round(float(self.sens_var.get()), 2)
-        self.cfg["compute_device"] = DEVICES.get(self.dev_cb.get(), "auto")
         self.cfg["preview"] = bool(self.preview_var.get())
         if hasattr(self, "_devices"):
             self.cfg["device_id"] = self._devices.get(self.device_cb.get(), "")
@@ -343,30 +414,30 @@ class App(tk.Tk):
             log.warning("字幕窗创建失败: %s", e)
             self.overlay = None
 
-        self.seg_queue = queue.Queue(maxsize=8)
+        self.stream_queue = queue.Queue(maxsize=256)   # 流式 ASR：按 100ms 块送音频
         self.disp_queue = queue.Queue()
-        self._last_partial = ""
-        self._last_final = ""       # 上一次成句文本（用于去重）
-        self._main_lang = None      # 本次运行识别到的主语言（用于过滤跨语言噪声）
-        self.segmenter = AudioSegmenter(
-            self.seg_queue, sensitivity=self.cfg["sensitivity"],
-            device_id=self.cfg.get("device_id", "") or None,
-            preview=self.cfg.get("preview", True))
+        try:
+            self.segmenter = AudioSegmenter(
+                self.stream_queue, sensitivity=self.cfg["sensitivity"],
+                device_id=self.cfg.get("device_id", "") or None)
+        except Exception as e:
+            log.exception("采集器启动失败: %s", e)
+            messagebox.showerror("错误", f"音频采集启动失败: {e}")
+            return
         self.segmenter.start()
+        log.info("切句引擎: %s", self.segmenter.vad_mode)
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
 
         self.running = True
-        self._asr_start_ts = time.time()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status_var.set("运行中：正在加载识别模型（GPU 首次初始化需数秒）……")
+        self.status_var.set("运行中：正在准备流式识别模型……")
 
     def stop(self):
         if not self.running:
             return
         self.running = False
-        self._asr_start_ts = None
         if self.segmenter:
             self.segmenter.stop()
         if self.overlay:
@@ -386,24 +457,7 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------- 工作线程
     def _worker_loop(self):
-        from transcribe import (transcribe_pieces, detect_device, actual_device,
-                                split_sentences)   # split_sentences 重导出，供测试使用
         from translate import Translator
-
-        # 预加载模型：不等第一段语音到达才加载，显著降低首个字幕的延迟
-        try:
-            from transcribe import get_model, actual_device
-            get_model(self.cfg["model_size"], self.cfg.get("compute_device", "auto"))
-            dev = actual_device()
-            self.disp_queue.put(
-                ("status", f"识别模型已就绪（{'GPU' if dev == 'cuda' else 'CPU'}），"
-                           f"正在监听视频声音……"))
-            self._asr_start_ts = None
-            self._compute_dev = dev
-        except Exception as e:
-            log.exception("模型加载失败: %s", e)
-            self.disp_queue.put(("status", f"模型加载失败: {e}"))
-            return
 
         llm_cfg = None
         if self.cfg["translate_engine"] == "llm" or self.cfg["llm_api_key"]:
@@ -412,72 +466,99 @@ class App(tk.Tk):
                        "model": self.cfg["llm_model"]}
         tr = Translator(engine=self.cfg["translate_engine"],
                         target_lang="zh-CN", llm_config=llm_cfg)
+        self._loop_streaming(tr)
+
+    # ------------------------------------------------------------ 流式循环
+    def _loop_streaming(self, tr):
+        """真流式：每 100ms 一块持续喂给流式引擎，边说边出字幕"""
+        import asr_stream
+        from streaming import LocalAgreement
+
+        if not asr_stream.available():
+            self.disp_queue.put(
+                ("status", "缺少 sherpa-onnx：请运行 install.bat 安装依赖"))
+            return
+        if asr_stream.find_model_dir() is None:
+            self.disp_queue.put(("status", "首次使用：正在下载流式模型（约 240MB）…"))
+            try:
+                asr_stream.download_model()
+            except Exception as e:
+                log.exception("流式模型下载失败: %s", e)
+                self.disp_queue.put(("status", f"流式模型下载失败: {e}"))
+                return
+        try:
+            engine = asr_stream.StreamingASR(num_threads=4)
+        except Exception as e:
+            log.exception("流式引擎启动失败: %s", e)
+            self.disp_queue.put(("status", f"流式引擎启动失败: {e}"))
+            return
+
+        self.disp_queue.put(("status", "流式引擎已就绪（延迟约 1 秒），正在监听视频声音……"))
+        la = LocalAgreement()
+        last_committed = ""
 
         while self.running:
             try:
-                pcm, partial = self.seg_queue.get(timeout=0.3)
+                kind, payload = self.stream_queue.get(timeout=0.3)
             except queue.Empty:
                 continue
-            # 防止积压：只保留最新片段（避免延迟越滚越大）
-            # 但优先保留"成句"结果，否则整句会被后来的预览片段覆盖掉
-            pending = [(pcm, partial)]
             try:
-                while True:
-                    pending.append(self.seg_queue.get_nowait())
-            except queue.Empty:
-                pass
-            finals = [x for x in pending if not x[1]]
-            pcm, partial = finals[-1] if finals else pending[-1]
-            try:
-                if not self._compute_dev:
-                    self._compute_dev = actual_device()
-                t0 = time.time()
-                pieces, src_lang, lang_prob = transcribe_pieces(
-                    pcm, model_size=self.cfg["model_size"],
-                    language=self.cfg["source_lang"],
-                    device=self.cfg.get("compute_device", "auto"))
-                asr_ms = (time.time() - t0) * 1000
-                if not pieces:
+                if kind == "start":
+                    engine.start(payload)      # 新的一句话，带上预卷音频
+                    la.reset()
+                    last_committed = ""
                     continue
-                text = "".join(pieces)
-                # 语言一致性：与已确定的主语言不符且置信度不高 -> 判为噪声幻觉
-                if src_lang:
-                    if self._main_lang is None:
-                        self._main_lang = src_lang
-                    elif src_lang != self._main_lang and lang_prob < 0.95:
-                        log.info("跳过跨语言噪声: %s (%s, p=%.2f)",
-                                 text[:30], src_lang, lang_prob)
+                if kind == "cancel":
+                    engine.reset()             # 太短的段，判定为误触发，丢弃
+                    la.reset()
+                    last_committed = ""
+                    continue
+                if kind == "end":
+                    text = engine.finish().strip()
+                    la.reset()
+                    last_committed = ""
+                    if self._bad(text):
                         continue
-                if partial:
-                    # 部分结果：与上一次相同则不必重复翻译/刷新
-                    if text == self._last_partial:
-                        continue
-                    self._last_partial = text
-                    # 预览只显示"当前正在说的这一两句"，避免长段越滚越成一串
-                    sentences = pieces[-2:]
-                else:
-                    # 与上一次成句完全相同（预览已完整显示过）-> 不重复刷新
-                    if text == self._last_final:
-                        continue
-                    self._last_final = text
                     self._stats["sentences"] += 1
-                    self._last_partial = ""
-                    # 成句：已切好的字幕块，逐条显示
-                    sentences = pieces
-                for i, sent in enumerate(sentences):
-                    translated = None
-                    if not (src_lang and src_lang.startswith("zh")):
-                        translated = tr.translate(sent, src_lang=src_lang)
-                    else:
-                        translated = sent  # 本身就是中文
-                    self.disp_queue.put(("subtitle", sent, translated, asr_ms,
-                                         src_lang, partial))
-                    # 逐条间隔刷新，否则多条会在一次轮询里被最后一条盖掉
-                    if i < len(sentences) - 1 and self.running:
-                        time.sleep(SENTENCE_GAP)
+                    sents = group_pieces([text]) or [text]
+                    for i, sent in enumerate(sents):
+                        dst = self._translate(tr, sent)
+                        self.disp_queue.put(("subtitle", sent, dst, 0.0, True))
+                        # 逐条间隔刷新，否则多条会在一次轮询里被最后一条盖掉
+                        if i < len(sents) - 1 and self.running:
+                            time.sleep(SENTENCE_GAP)
+                    continue
+                # ---- audio：边说边出 ----
+                t0 = time.time()
+                text = engine.feed(payload).strip()
+                asr_ms = (time.time() - t0) * 1000
+                if not self.cfg.get("preview", True) or self._bad(text):
+                    continue
+                committed, _pending = la.update(text)
+                if not committed or committed == last_committed:
+                    continue
+                last_committed = committed
+                # 原文显示完整假设（含未定稿尾巴，小字实时滚动）；
+                # 译文只给已定稿部分（黄色大字保持稳定，不来回改）
+                self.disp_queue.put(
+                    ("subtitle", text, self._translate(tr, committed), asr_ms, False))
             except Exception as e:
-                log.exception("处理片段出错: %s", e)
-                self.disp_queue.put(("status", f"处理出错: {e}"))
+                log.exception("流式处理出错: %s", e)
+
+    # ------------------------------------------------------------ 工具
+    @staticmethod
+    def _bad(text):
+        """噪声/幻觉过滤"""
+        if not text or len(text.strip()) < 2:
+            return True
+        return is_garbage(text)
+
+    def _translate(self, tr, text):
+        """中文直接显示，其他语言送去翻译"""
+        if looks_chinese(text):
+            return text
+        lang = self.cfg.get("source_lang", "auto")
+        return tr.translate(text, src_lang=None if lang == "auto" else lang)
 
     # -------------------------------------------------------------- 轮询
     def _poll(self):
@@ -495,14 +576,14 @@ class App(tk.Tk):
             while True:
                 item = self.disp_queue.get_nowait()
                 if item[0] == "subtitle":
-                    _, src, dst, asr_ms, lang, partial = item
+                    _, src, dst, asr_ms, final = item
                     self._last_sub_time = time.time()
-                    self._show_subtitle(src, dst, partial)
+                    self._show_subtitle(src, dst, partial=not final)
                     engine_name = "LLM" if self.cfg["translate_engine"] == "llm" else "在线"
-                    tag = "实时" if partial else "成句"
+                    tag = "成句" if final else "实时"
                     self.status_var.set(
                         f"运行中 | 已识别 {self._stats['sentences']} 句 | {tag} "
-                        f"识别耗时 {asr_ms:.0f}ms | 语言 {lang or '?'} | 翻译: {engine_name}")
+                        f"识别耗时 {asr_ms:.0f}ms | 翻译: {engine_name}")
                     tail = (dst or src)[:40]
                     self.last_var.set(f"最新: {tail}")
                 elif item[0] == "status":
@@ -510,12 +591,6 @@ class App(tk.Tk):
                         self.status_var.set(item[1])
         except queue.Empty:
             pass
-        # GPU 迟迟没出结果（显卡被其他程序占满时会卡住）-> 提示
-        if getattr(self, "_asr_start_ts", None) and time.time() - self._asr_start_ts > 60:
-            self.status_var.set(
-                "首次识别超过 60 秒未完成：显卡可能正被其他程序占满。"
-                "可关闭占用程序，或在「运行设备」切换为 CPU 后重新开始。")
-            self._asr_start_ts = None
         # 字幕淡出
         if self.overlay and self._last_sub_time and time.time() - self._last_sub_time > SUB_DURATION:
             self.overlay.clear()

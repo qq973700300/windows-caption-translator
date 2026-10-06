@@ -1,6 +1,10 @@
-faster-whisper
-soundcard
-deep-translator
+# 运行时依赖（全部为 CPU 版，不再需要 CUDA）
+soundcard          # WASAPI loopback 采集系统声音
+sherpa-onnx        # 流式 Paraformer 识别引擎
+onnxruntime        # Silero VAD 推理
+numpy
+deep-translator    # Google 翻译通道
+requests           # Transmart / MyMemory / LLM 通道
+
+# 仅测试脚本用到（make_test_wav.py 生成 TTS 测试音频）
 pyttsx3
-nvidia-cublas-cu12
-nvidia-cudnn-cu12
