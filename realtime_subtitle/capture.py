@@ -30,6 +30,7 @@ SILENCE_EXIT_FRAMES = 4     # 连续 4 帧无人声（0.4s）=> 一句话结束
 MIN_SEGMENT_FRAMES = 5      # 短于 0.5s 的段丢弃（过滤误触发的碎片）
 MAX_SEGMENT_FRAMES = 90     # 单句最长 9s，强制切分（避免长段连成一串）
 RING16_FRAMES = 8           # 最近 8 个 16k 块（0.8s）作为预卷缓冲
+SILENT_RMS = 1e-4           # 低于此值视为"没声音"（语音通常 0.01~0.2，静音底噪约 1e-12）
 
 
 def list_output_devices():
@@ -55,6 +56,7 @@ class AudioSegmenter(threading.Thread):
         self._speech_frames = 0
         self._silence_run = 0
         self._speech_run = 0
+        self._silent_run = 0        # 连续"没声音"的帧数（用于提示选错了设备）
         self._silero = self._init_silero()
         # 供测试/调试观察每次切句：on_event(kind)
         self.on_event = None
@@ -76,6 +78,11 @@ class AudioSegmenter(threading.Thread):
     def vad_mode(self):
         return "silero"
 
+    @property
+    def silent_seconds(self):
+        """已经连续多少秒没采集到声音（供 UI 判断是不是选错了设备）"""
+        return self._silent_run * BLOCK_MS / 1000.0
+
     # ------------------------------------------------------------------
     @staticmethod
     def _downsample_to_16k(mono):
@@ -88,6 +95,9 @@ class AudioSegmenter(threading.Thread):
         抽成独立方法：既被采集循环调用，也方便离线喂数据做断句测试"""
         rms = float(np.sqrt(np.mean(mono * mono)) + 1e-12)
         self.level_rms = rms
+        # 持续没声音通常不是"视频没在播"，而是选错了音频来源
+        # （选中的设备并非真正在出声的那个），UI 据此给出提示
+        self._silent_run = self._silent_run + 1 if rms < SILENT_RMS else 0
         mono16 = self._downsample_to_16k(mono)
         self._ring16.append(mono16)
         speech, prob = self._silero.is_speech(mono16)

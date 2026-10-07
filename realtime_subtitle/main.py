@@ -3,11 +3,18 @@
 实时视频翻译字幕（流式方案）
 
 链路：系统声音 loopback 采集 -> Silero VAD 切句 -> 流式 Paraformer 增量识别
-      -> LocalAgreement 定稿 -> 翻译 -> 固定尺寸悬浮字幕窗
+      -> LocalAgreement 定稿 -> 翻译（独立线程）-> 固定尺寸悬浮字幕窗
 
 已移除的旧方案（不再保留回退）：
   - 能量阈值 VAD（对背景音乐敏感）-> 统一 Silero VAD
   - Whisper 整段识别（必须攒够音频再整段重跑，延迟高）-> 统一流式 Paraformer
+
+架构底线：**ASR 永远不等翻译**。
+  翻译是耗时不可控的网络请求，若同步调用会卡住整条流水线（音频块堆积、
+  stream_queue 塞满后丢音频、识别质量下降）。因此：
+  - 预览阶段（边说边出）只显示原文，不翻译
+  - 一句话说完（VAD end）才入翻译队列，一条成句 = 一次翻译请求
+  - 翻译在自己的线程里串行执行，结果回 UI；队列满则丢最旧的
 """
 import json
 import logging
@@ -258,6 +265,9 @@ class App(tk.Tk):
         self.worker = None
         self.stream_queue = queue.Queue(maxsize=256)
         self.disp_queue = queue.Queue()
+        self.trans_q = None          # 翻译工作线程（P0：与 ASR 解耦）
+        self._seq = 0                # 成句序号，防止慢翻译回来覆盖新句子
+        self._last_final_seq = 0
         self.running = False
         self._last_sub_time = 0
         self._stats = {"sentences": 0}
@@ -416,6 +426,9 @@ class App(tk.Tk):
 
         self.stream_queue = queue.Queue(maxsize=256)   # 流式 ASR：按 100ms 块送音频
         self.disp_queue = queue.Queue()
+        self._seq = 0
+        self._last_final_seq = 0
+        self._start_translator()
         try:
             self.segmenter = AudioSegmenter(
                 self.stream_queue, sensitivity=self.cfg["sensitivity"],
@@ -434,10 +447,37 @@ class App(tk.Tk):
         self.stop_btn.config(state="normal")
         self.status_var.set("运行中：正在准备流式识别模型……")
 
+    def _start_translator(self):
+        """启动独立翻译线程（ASR 线程只投递请求，不等结果）"""
+        try:
+            from translate import Translator
+            from transworker import TranslationWorker
+        except Exception as e:
+            log.exception("翻译模块加载失败: %s", e)
+            messagebox.showerror("错误", f"翻译模块加载失败: {e}")
+            return
+        llm_cfg = None
+        if self.cfg["translate_engine"] == "llm" or self.cfg["llm_api_key"]:
+            llm_cfg = {"base_url": self.cfg["llm_base_url"],
+                       "api_key": self.cfg["llm_api_key"],
+                       "model": self.cfg["llm_model"]}
+        lang = self.cfg.get("source_lang", "auto")
+        tr = Translator(engine=self.cfg["translate_engine"],
+                        target_lang="zh-CN", llm_config=llm_cfg)
+        self.trans_q = TranslationWorker(
+            self.disp_queue, tr,
+            src_lang=None if lang == "auto" else lang,
+            min_gap=SENTENCE_GAP, is_zh=looks_chinese)
+        self.trans_q.start()
+        log.info("翻译线程已启动（引擎=%s）", self.cfg["translate_engine"])
+
     def stop(self):
         if not self.running:
             return
         self.running = False
+        if self.trans_q:
+            self.trans_q.stop()
+            self.trans_q = None
         if self.segmenter:
             self.segmenter.stop()
         if self.overlay:
@@ -457,19 +497,11 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------- 工作线程
     def _worker_loop(self):
-        from translate import Translator
-
-        llm_cfg = None
-        if self.cfg["translate_engine"] == "llm" or self.cfg["llm_api_key"]:
-            llm_cfg = {"base_url": self.cfg["llm_base_url"],
-                       "api_key": self.cfg["llm_api_key"],
-                       "model": self.cfg["llm_model"]}
-        tr = Translator(engine=self.cfg["translate_engine"],
-                        target_lang="zh-CN", llm_config=llm_cfg)
-        self._loop_streaming(tr)
+        """ASR 线程：只做采集->VAD->识别，翻译一律投递出去，绝不在这里等"""
+        self._loop_streaming()
 
     # ------------------------------------------------------------ 流式循环
-    def _loop_streaming(self, tr):
+    def _loop_streaming(self):
         """真流式：每 100ms 一块持续喂给流式引擎，边说边出字幕"""
         import asr_stream
         from streaming import LocalAgreement
@@ -496,6 +528,7 @@ class App(tk.Tk):
         self.disp_queue.put(("status", "流式引擎已就绪（延迟约 1 秒），正在监听视频声音……"))
         la = LocalAgreement()
         last_committed = ""
+        last_preview = ""
 
         while self.running:
             try:
@@ -520,28 +553,36 @@ class App(tk.Tk):
                     if self._bad(text):
                         continue
                     self._stats["sentences"] += 1
-                    sents = group_pieces([text]) or [text]
-                    for i, sent in enumerate(sents):
-                        dst = self._translate(tr, sent)
-                        self.disp_queue.put(("subtitle", sent, dst, 0.0, True))
-                        # 逐条间隔刷新，否则多条会在一次轮询里被最后一条盖掉
-                        if i < len(sents) - 1 and self.running:
-                            time.sleep(SENTENCE_GAP)
+                    # 先立刻把完整的原文顶上去（不带 …），译文留空等翻译线程回填
+                    self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
+                    for sent in (group_pieces([text]) or [text]):
+                        self._seq += 1
+                        if self.trans_q:
+                            self.trans_q.submit(self._seq, sent)
+                        else:                       # 翻译线程没起来：至少显示原文
+                            self.disp_queue.put(
+                                ("subtitle", sent, "", 0.0, True, self._seq))
                     continue
-                # ---- audio：边说边出 ----
+                # ---- audio：边说边出（只滚原文，不翻译） ----
+                # 注意：必须先喂音频给流式引擎，再决定要不要显示。
+                # 关掉预览只是"不显示"，不能连音频都不喂，否则引擎收不到数据。
                 t0 = time.time()
                 text = engine.feed(payload).strip()
                 asr_ms = (time.time() - t0) * 1000
-                if not self.cfg.get("preview", True) or self._bad(text):
+                if self._bad(text):
                     continue
                 committed, _pending = la.update(text)
-                if not committed or committed == last_committed:
-                    continue
                 last_committed = committed
-                # 原文显示完整假设（含未定稿尾巴，小字实时滚动）；
-                # 译文只给已定稿部分（黄色大字保持稳定，不来回改）
-                self.disp_queue.put(
-                    ("subtitle", text, self._translate(tr, committed), asr_ms, False))
+                if not self.cfg.get("preview", True):
+                    continue
+                # LocalAgreement 仍维护定稿状态（P1 的暂译会用到），
+                # 但不再拿它触发翻译 —— 否则一句长句会打 5~10 次 API
+                committed, _pending = la.update(text)
+                last_committed = committed
+                if text == last_preview:
+                    continue
+                last_preview = text
+                self.disp_queue.put(("subtitle", text, "", asr_ms, False, -1))
             except Exception as e:
                 log.exception("流式处理出错: %s", e)
 
@@ -552,13 +593,6 @@ class App(tk.Tk):
         if not text or len(text.strip()) < 2:
             return True
         return is_garbage(text)
-
-    def _translate(self, tr, text):
-        """中文直接显示，其他语言送去翻译"""
-        if looks_chinese(text):
-            return text
-        lang = self.cfg.get("source_lang", "auto")
-        return tr.translate(text, src_lang=None if lang == "auto" else lang)
 
     # -------------------------------------------------------------- 轮询
     def _poll(self):
@@ -576,19 +610,29 @@ class App(tk.Tk):
             while True:
                 item = self.disp_queue.get_nowait()
                 if item[0] == "subtitle":
-                    _, src, dst, asr_ms, final = item
+                    _, src, dst, asr_ms, final = item[:5]
+                    seq = item[5] if len(item) > 5 else -1
+                    # 慢翻译回来时可能已经有更新的句子上屏了，过期结果直接丢弃
+                    if final and seq >= 0 and seq < self._last_final_seq:
+                        continue
+                    if final and seq >= 0:
+                        self._last_final_seq = seq
                     self._last_sub_time = time.time()
                     self._show_subtitle(src, dst, partial=not final)
                     engine_name = "LLM" if self.cfg["translate_engine"] == "llm" else "在线"
                     tag = "成句" if final else "实时"
+                    done = self.trans_q.done if self.trans_q else 0
+                    pend = (self.trans_q.q.qsize() if self.trans_q else 0)
                     self.status_var.set(
-                        f"运行中 | 已识别 {self._stats['sentences']} 句 | {tag} "
-                        f"识别耗时 {asr_ms:.0f}ms | 翻译: {engine_name}")
+                        f"运行中 | 已识别 {self._stats['sentences']} 句 | "
+                        f"已翻译 {done} 句（待译 {pend}） | {tag} "
+                        f"识别耗时 {asr_ms:.0f}ms | 翻译: {engine_name}"
+                        + self._silent_hint())
                     tail = (dst or src)[:40]
                     self.last_var.set(f"最新: {tail}")
                 elif item[0] == "status":
                     if not self.running or time.time() - self._last_sub_time > 2:
-                        self.status_var.set(item[1])
+                        self.status_var.set(item[1] + self._silent_hint())
         except queue.Empty:
             pass
         # 字幕淡出
@@ -596,6 +640,21 @@ class App(tk.Tk):
             self.overlay.clear()
             self._last_sub_time = 0
         self.after(120, self._poll)
+
+    def _silent_hint(self):
+        """长时间没采到声音 -> 很可能是「音频来源」选错了设备
+
+        这是最容易让人以为"软件坏了"的坑：设备列表里确实有那个设备，
+        但视频的声音其实从另一路出去，loopback 抓到的就是纯零。
+        """
+        if not (self.running and self.segmenter):
+            return ""
+        try:
+            if self.segmenter.silent_seconds >= 5:
+                return " | ⚠ 5 秒没采到声音：请确认「音频来源」选的是正在出声的那个设备"
+        except Exception:
+            pass
+        return ""
 
     def _show_subtitle(self, src, dst, partial=False):
         if self.overlay:

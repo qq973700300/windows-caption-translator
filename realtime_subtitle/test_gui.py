@@ -3,6 +3,8 @@
 
 1) 字幕窗尺寸固定：短句 / 长句 / 清空三种情况下窗口高度必须一致
 2) 端到端：启动界面 -> 点击开始 -> 播放测试语音 -> 检查字幕窗是否出现译文
+   P0 之后译文由独立翻译线程回填，所以这里等到译文出现为止，
+   并统计翻译调用次数（一条成句只应翻译一次）
 """
 import os
 import sys
@@ -60,6 +62,24 @@ app.start()          # 等价于点击「开始翻译」
 app.update()
 print("started, overlay:", bool(app.overlay))
 
+
+class SpyTranslator:
+    """翻译探针：记录调用次数，模拟 0.2s 的引擎延迟"""
+
+    def __init__(self):
+        self.calls = []
+
+    def translate(self, text, src_lang=None):
+        self.calls.append(text)
+        time.sleep(0.2)
+        return "【测试译文】" + text
+
+
+spy = SpyTranslator()
+if app.trans_q:
+    app.trans_q.tr = spy        # 换掉真实引擎：不依赖网络，且能精确计数
+    print("翻译探针已注入")
+
 with wave.open(WAV, "rb") as w:
     sr = w.getframerate()
     data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
@@ -68,21 +88,32 @@ sc.default_speaker().play(data, samplerate=sr)
 print("played test speech, waiting for subtitle...")
 
 got_src = got_dst = None
-for _ in range(300):     # 最多等 30 秒
+for _ in range(400):     # 最多等 40 秒（译文要等翻译线程回填）
     app.update()
     if app.overlay:
         s = app.overlay.src_label.cget("text").strip()
         d = app.overlay.dst_label.cget("text").strip()
         if s:
             got_src, got_dst = s, d
+        if d:            # 译文出现才算端到端通
             break
     time.sleep(0.1)
 
+sentences = app._stats["sentences"]
 print("=" * 50)
 print("字幕原文:", got_src)
 print("字幕译文:", got_dst)
+print(f"成句数: {sentences} | 翻译调用: {len(spy.calls)} 次")
+for c in spy.calls:
+    print("   翻译了:", c)
 print("状态栏:", app.status_var.get())
 app.stop()
-e2e_ok = bool(got_src)
-print("\nGUI TEST:", "PASS" if (size_ok and e2e_ok) else
-      f"FAIL (固定尺寸={size_ok}, 端到端={e2e_ok})")
+e2e_ok = bool(got_dst)
+# 一句一次：调用次数不应超过成句数（旧行为是每增长一次就翻，会到几十次）
+once_ok = len(spy.calls) <= max(sentences, 1)
+print("一句一次:", "PASS" if once_ok else f"FAIL 调用 {len(spy.calls)} > 成句 {sentences}")
+ok = size_ok and e2e_ok and once_ok
+print("\nGUI TEST:", "PASS" if ok else
+      f"FAIL (固定尺寸={size_ok}, 端到端={e2e_ok}, 一句一次={once_ok})")
+app.destroy()
+sys.exit(0 if ok else 1)
