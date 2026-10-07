@@ -29,7 +29,7 @@ class TranslationWorker:
     """串行翻译队列：一条 VAD 成句 = 一次翻译请求"""
 
     def __init__(self, out_queue, translator, src_lang=None,
-                 maxsize=32, min_gap=0.0, is_zh=None):
+                 maxsize=32, min_gap=0.0, is_zh=None, context=None):
         """
         out_queue:  UI 的显示队列（结果直接回 UI）
         translator: Translator 实例（只在本线程内使用）
@@ -37,6 +37,7 @@ class TranslationWorker:
         maxsize:    待翻译队列上限
         min_gap:    队列里仍有积压时的最小输出间隔（避免同一段多句互相盖掉）
         is_zh:      判断"已是中文"的函数（命中则直显，不打 API）
+        context:    TranslationContext（P1：把最近几句原文+译文一起给 LLM 参考）
         """
         self.q = queue.Queue(maxsize=maxsize)
         self.out = out_queue
@@ -44,6 +45,7 @@ class TranslationWorker:
         self.src_lang = src_lang
         self.min_gap = min_gap
         self.is_zh = is_zh
+        self.ctx = context
         self._stop = threading.Event()
         self.thread = None
         self.dropped = 0     # 因队列满被丢弃的请求数
@@ -111,9 +113,13 @@ class TranslationWorker:
             dst = text                     # 识别出来就是中文：直接显示
         else:
             t0 = time.time()
-            dst = self.tr.translate(text, src_lang=self.src_lang) or ""
+            # 上下文只对 LLM 引擎有效；其他引擎是单句接口，传了也用不上
+            dst = self.tr.translate(text, src_lang=self.src_lang,
+                                    context=self.ctx) or ""
             logger.info("翻译 seq=%d 用时 %.2fs → %s",
                         seq, time.time() - t0, (dst or "")[:30])
+        if self.ctx is not None:
+            self.ctx.add(text, dst)        # 记入历史，供下一句参考
         self.done += 1
         # 带上原文一起回 UI：即使中间被预览字幕覆盖，最终显示的 src/dst 也是配对的
         self.out.put(("subtitle", text, dst, 0.0, True, seq))

@@ -68,10 +68,12 @@ DEFAULT_CONFIG = {
     "llm_base_url": "",
     "llm_api_key": "",
     "llm_model": "",
+    "context_turns": 3,           # 给 LLM 参考的历史句数（0 = 关闭，仅 LLM 引擎有效）
 }
 
 
 SENTENCE_GAP = 0.6      # 同一段里多句话时的逐句显示间隔（秒）
+SCENE_RESET_SEC = 60    # 连续静音超过这么久 -> 判定换片/换集，清空翻译上下文
 
 
 def load_config():
@@ -108,6 +110,8 @@ LANGS = {
 }
 ENGINES = {"自动（免费在线回退链）": "auto", "Google 翻译": "google",
            "MyMemory": "mymemory", "LLM API (OpenAI兼容)": "llm"}
+# 给 LLM 参考的历史句数（仅 LLM 引擎有效；免费引擎是单句接口，拿不到上下文）
+CTX_TURNS = {"关闭（每句独立）": 0, "1 句": 1, "2 句": 2, "3 句": 3, "5 句": 5}
 
 SUB_DURATION = 9.0  # 字幕停留秒数
 
@@ -266,6 +270,7 @@ class App(tk.Tk):
         self.stream_queue = queue.Queue(maxsize=256)
         self.disp_queue = queue.Queue()
         self.trans_q = None          # 翻译工作线程（P0：与 ASR 解耦）
+        self.ctx = None              # 翻译上下文（P1：最近几句原文+译文）
         self._seq = 0                # 成句序号，防止慢翻译回来覆盖新句子
         self._last_final_seq = 0
         self.running = False
@@ -350,6 +355,16 @@ class App(tk.Tk):
             entry.insert(0, self.cfg.get(
                 {"接口地址": "llm_base_url", "API Key": "llm_api_key", "模型名": "llm_model"}[label], ""))
             entry.bind("<FocusOut>", lambda e: self._save_now())
+        # 上下文句数：给 LLM 参考最近几句（0 = 关闭），只对 LLM 引擎有效
+        self.ctx_cb = ttk.Combobox(llmf, state="readonly",
+                                   values=list(CTX_TURNS.keys()), width=16)
+        ttk.Label(llmf, text="上下文句数").grid(row=3, column=0, sticky="e", padx=6, pady=3)
+        self.ctx_cb.grid(row=3, column=1, sticky="w", padx=6, pady=3)
+        self.ctx_cb.set(self._key_of(CTX_TURNS, int(self.cfg.get("context_turns", 3) or 0)))
+        self.ctx_cb.bind("<<ComboboxSelected>>", lambda e: self._save_now())
+        ttk.Label(llmf, text="把最近几句原文+译文一起给模型参考，代词/人名更连贯",
+                  foreground="#666", font=("Microsoft YaHei UI", 8)).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=6)
         llmf.columnconfigure(1, weight=1)
 
         # 状态
@@ -402,6 +417,8 @@ class App(tk.Tk):
         self.cfg["llm_base_url"] = self.llm_url.get().strip()
         self.cfg["llm_api_key"] = self.llm_key.get().strip()
         self.cfg["llm_model"] = self.llm_model.get().strip()
+        if hasattr(self, "ctx_cb"):
+            self.cfg["context_turns"] = CTX_TURNS.get(self.ctx_cb.get(), 3)
 
     def _save_now(self):
         self._collect_cfg()
@@ -452,6 +469,7 @@ class App(tk.Tk):
         try:
             from translate import Translator
             from transworker import TranslationWorker
+            from context import TranslationContext
         except Exception as e:
             log.exception("翻译模块加载失败: %s", e)
             messagebox.showerror("错误", f"翻译模块加载失败: {e}")
@@ -464,12 +482,15 @@ class App(tk.Tk):
         lang = self.cfg.get("source_lang", "auto")
         tr = Translator(engine=self.cfg["translate_engine"],
                         target_lang="zh-CN", llm_config=llm_cfg)
+        turns = int(self.cfg.get("context_turns", 3) or 0)
+        self.ctx = TranslationContext(max_turns=turns)
         self.trans_q = TranslationWorker(
             self.disp_queue, tr,
             src_lang=None if lang == "auto" else lang,
-            min_gap=SENTENCE_GAP, is_zh=looks_chinese)
+            min_gap=SENTENCE_GAP, is_zh=looks_chinese, context=self.ctx)
         self.trans_q.start()
-        log.info("翻译线程已启动（引擎=%s）", self.cfg["translate_engine"])
+        log.info("翻译线程已启动（引擎=%s，上下文 %d 句）",
+                 self.cfg["translate_engine"], turns)
 
     def stop(self):
         if not self.running:
@@ -534,6 +555,7 @@ class App(tk.Tk):
             try:
                 kind, payload = self.stream_queue.get(timeout=0.3)
             except queue.Empty:
+                self._maybe_reset_scene()
                 continue
             try:
                 if kind == "start":
@@ -585,6 +607,22 @@ class App(tk.Tk):
                 self.disp_queue.put(("subtitle", text, "", asr_ms, False, -1))
             except Exception as e:
                 log.exception("流式处理出错: %s", e)
+
+    def _maybe_reset_scene(self):
+        """连续静音过久 -> 判定换片/换集，清空翻译上下文
+
+        不清的话，上一集的人物和译法会一路带进下一集（第一集的 John
+        可能和第二集的 John 不是一个人，术语也会串）。
+        """
+        if not (self.ctx and self.segmenter):
+            return
+        try:
+            if self.segmenter.silent_seconds >= SCENE_RESET_SEC and len(self.ctx):
+                sid = self.ctx.reset()
+                log.info("静音 %d 秒，翻译上下文已重置（场景 #%d）",
+                         SCENE_RESET_SEC, sid)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 工具
     @staticmethod

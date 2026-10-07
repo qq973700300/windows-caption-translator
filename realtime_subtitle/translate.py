@@ -104,17 +104,21 @@ class Translator:
         r.raise_for_status()
         return "".join(x[0] for x in r.json()[0] if x and x[0])
 
-    def _llm(self, text, src_lang):
+    def _llm(self, text, src_lang, context=None):
         base = self.llm_config.get("base_url", "").rstrip("/")
         key = self.llm_config.get("api_key", "")
         model = self.llm_config.get("model", "")
         if not (base and key and model):
             raise RuntimeError("LLM 配置不完整")
         tgt_name = "简体中文" if self.target.startswith("zh") else self.target
-        prompt = (
-            f"你是实时字幕翻译器。把下面这段语音识别文本翻译成{tgt_name}，"
-            f"只输出译文本身，不要解释、不要引号。\n\n{text}"
-        )
+        # 有上下文就用三段式 prompt（历史只作参考，只翻当前句）
+        prompt = context.build_prompt(text, tgt_name) if context else None
+        use_ctx = prompt is not None
+        if prompt is None:
+            prompt = (
+                f"你是实时字幕翻译器。把下面这段语音识别文本翻译成{tgt_name}，"
+                f"只输出译文本身，不要解释、不要引号。\n\n{text}"
+            )
         resp = requests.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
@@ -127,11 +131,16 @@ class Translator:
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        out = resp.json()["choices"][0]["message"]["content"].strip()
+        logger.debug("LLM 翻译（上下文=%s）: %s -> %s", use_ctx, text[:20], out[:20])
+        return out
 
     # ------------------------------------------------------------------
-    def translate(self, text, src_lang=None):
-        """带缓存与回退的翻译入口。失败返回 None（UI 显示原文）"""
+    def translate(self, text, src_lang=None, context=None):
+        """带缓存与回退的翻译入口。失败返回 None（UI 显示原文）
+
+        context: TranslationContext，仅 LLM 引擎会用到（其他引擎是单句接口）
+        """
         if not text or not text.strip():
             return None
         # 源语言即目标语言：原样返回
@@ -161,7 +170,7 @@ class Translator:
                 try:
                     t0 = time.time()
                     if eng == "llm":
-                        result = self._llm(text, src_lang)
+                        result = self._llm(text, src_lang, context=context)
                     elif eng == "transmart":
                         result = self._transmart(text, src_lang)
                     elif eng == "mymemory":
