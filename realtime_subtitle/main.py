@@ -39,6 +39,7 @@ LOG_PATH = os.path.join(BASE_DIR, "subtitle.log")
 sys.path.insert(0, _MODULE_DIR)
 
 from textutil import group_pieces, looks_chinese, is_garbage  # noqa: E402
+from glossary import Glossary                                 # noqa: E402
 
 # 日志落盘；若目录不可写（如装在 Program Files）则退到临时目录，不阻断启动
 try:
@@ -271,6 +272,8 @@ class App(tk.Tk):
         self.disp_queue = queue.Queue()
         self.trans_q = None          # 翻译工作线程（P0：与 ASR 解耦）
         self.ctx = None              # 翻译上下文（P1：最近几句原文+译文）
+        self.glossary = Glossary()   # 术语表（P2：人名/地名固定译法）
+        self.glossary.load()
         self._seq = 0                # 成句序号，防止慢翻译回来覆盖新句子
         self._last_final_seq = 0
         self.running = False
@@ -365,6 +368,13 @@ class App(tk.Tk):
         ttk.Label(llmf, text="把最近几句原文+译文一起给模型参考，代词/人名更连贯",
                   foreground="#666", font=("Microsoft YaHei UI", 8)).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=6)
+        # 术语表（P2）：发现某个译法不对，直接加一条，命中时强制沿用
+        gf = ttk.Frame(llmf)
+        gf.grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
+        ttk.Button(gf, text="术语表…", command=self._open_glossary).pack(side="left")
+        self.glossary_var = tk.StringVar(value=self._glossary_hint())
+        ttk.Label(gf, textvariable=self.glossary_var, foreground="#666",
+                  font=("Microsoft YaHei UI", 8)).pack(side="left", padx=8)
         llmf.columnconfigure(1, weight=1)
 
         # 状态
@@ -380,6 +390,83 @@ class App(tk.Tk):
         self.bind("<<close-overlay>>", lambda e: self.stop())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_devices()
+
+    def _glossary_hint(self):
+        n = len(self.glossary)
+        return f"已设置 {n} 条" if n else "人名/地名译法不一致时点这里加"
+
+    def _open_glossary(self):
+        """术语表编辑器：看到某个人名/地名译得不对，直接加一条固定译法"""
+        win = tk.Toplevel(self)
+        win.title("术语表（仅 LLM 引擎生效）")
+        win.geometry("580x430")
+        win.transient(self)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        frm = ttk.Frame(win)
+        frm.pack(fill="both", expand=True, padx=10, pady=8)
+        ttk.Label(frm, text="人名 / 地名 / 专有名词的固定译法。命中时写入 prompt 强制沿用。",
+                  foreground="#666", justify="left").pack(anchor="w", pady=(0, 6))
+
+        table = ttk.Frame(frm)
+        table.pack(fill="both", expand=True)
+        tree = ttk.Treeview(table, columns=("src", "dst"), show="headings", height=12)
+        tree.heading("src", text="原文")
+        tree.heading("dst", text="固定译法")
+        tree.column("src", width=250, anchor="w")
+        tree.column("dst", width=250, anchor="w")
+        sb = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        def refill():
+            tree.delete(*tree.get_children())
+            for k, v in self.glossary.items():
+                tree.insert("", "end", values=(k, v))
+            self.glossary_var.set(self._glossary_hint())
+
+        refill()
+
+        edit = ttk.Frame(frm)
+        edit.pack(fill="x", pady=6)
+        e_src = ttk.Entry(edit, width=24)
+        e_dst = ttk.Entry(edit, width=24)
+        ttk.Label(edit, text="原文").grid(row=0, column=0, padx=(0, 4))
+        e_src.grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(edit, text="译法").grid(row=0, column=2, padx=(0, 4))
+        e_dst.grid(row=0, column=3, padx=(0, 8))
+
+        def do_add():
+            s, d = e_src.get().strip(), e_dst.get().strip()
+            if not s or not d:
+                return
+            self.glossary.set(s, d)
+            self.glossary.save()
+            e_src.delete(0, "end")
+            e_dst.delete(0, "end")
+            refill()
+
+        def do_del():
+            for iid in tree.selection():
+                vals = tree.item(iid, "values")
+                if vals:
+                    self.glossary.remove(vals[0])
+            self.glossary.save()
+            refill()
+
+        ttk.Button(edit, text="添加 / 更新", command=do_add).grid(row=0, column=4, padx=4)
+        ttk.Button(edit, text="删除选中", command=do_del).grid(row=0, column=5, padx=4)
+        e_dst.bind("<Return>", lambda e: do_add())
+
+        ttk.Label(frm, text="保存在 glossary.json（与程序同级）。改完立即生效，"
+                           "已缓存的旧译文会同时作废。",
+                  foreground="#888", font=("Microsoft YaHei UI", 8),
+                  justify="left").pack(anchor="w")
+        ttk.Button(frm, text="关闭", command=win.destroy).pack(anchor="e", pady=(6, 0))
 
     def _refresh_devices(self):
         """填充音频来源下拉框（音频输出设备列表）"""
@@ -483,14 +570,16 @@ class App(tk.Tk):
         tr = Translator(engine=self.cfg["translate_engine"],
                         target_lang="zh-CN", llm_config=llm_cfg)
         turns = int(self.cfg.get("context_turns", 3) or 0)
-        self.ctx = TranslationContext(max_turns=turns)
+        # 每次开始都重新读一遍术语表（编辑器可能刚改过）
+        self.glossary.load()
+        self.ctx = TranslationContext(max_turns=turns, glossary=self.glossary)
         self.trans_q = TranslationWorker(
             self.disp_queue, tr,
             src_lang=None if lang == "auto" else lang,
             min_gap=SENTENCE_GAP, is_zh=looks_chinese, context=self.ctx)
         self.trans_q.start()
-        log.info("翻译线程已启动（引擎=%s，上下文 %d 句）",
-                 self.cfg["translate_engine"], turns)
+        log.info("翻译线程已启动（引擎=%s，上下文 %d 句，术语表 %d 条）",
+                 self.cfg["translate_engine"], turns, len(self.glossary))
 
     def stop(self):
         if not self.running:
@@ -614,7 +703,7 @@ class App(tk.Tk):
         不清的话，上一集的人物和译法会一路带进下一集（第一集的 John
         可能和第二集的 John 不是一个人，术语也会串）。
         """
-        if not (self.ctx and self.segmenter):
+        if self.ctx is None or self.segmenter is None:
             return
         try:
             if self.segmenter.silent_seconds >= SCENE_RESET_SEC and len(self.ctx):

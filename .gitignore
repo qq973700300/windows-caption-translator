@@ -8,6 +8,7 @@ env/
 
 # 运行时产物（config.json 可能含 API Key，不要提交）
 config.json
+glossary.json
 *.log
 subtitle.log
 

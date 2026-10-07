@@ -112,7 +112,8 @@ class Translator:
             raise RuntimeError("LLM 配置不完整")
         tgt_name = "简体中文" if self.target.startswith("zh") else self.target
         # 有上下文就用三段式 prompt（历史只作参考，只翻当前句）
-        prompt = context.build_prompt(text, tgt_name) if context else None
+        # 注意用 is not None：上下文对象即使历史为空也是有效的（术语表仍要注入）
+        prompt = context.build_prompt(text, tgt_name) if context is not None else None
         use_ctx = prompt is not None
         if prompt is None:
             prompt = (
@@ -146,7 +147,7 @@ class Translator:
         # 源语言即目标语言：原样返回
         if src_lang and src_lang.startswith("zh") and self.target.startswith("zh"):
             return text
-        key = text.strip()
+        key = self._cache_key(text, context)
         if key in self._cache:
             return self._cache[key]
 
@@ -196,3 +197,25 @@ class Translator:
                 self._cache.clear()
             self._cache[key] = result
         return result
+
+    # ------------------------------------------------------------------
+    def _cache_key(self, text, context=None):
+        """P2：语境缓存键
+
+        单句引擎（transmart / mymemory / google）的译文只取决于这句话本身，
+        所以仍用纯文本 key —— 缓存命中率不受影响。
+
+        LLM 会把上下文和术语表一起看，同一句英文在不同对话里可能该翻成
+        不同的意思，所以 key 里要带上 场景号 / 词典版本 / 上下文指纹，
+        避免"上一集的译文被这一集复用"。
+        """
+        key = (text or "").strip()
+        if context is None or self.engine != "llm":
+            return key
+        try:
+            return context.cache_key(key)
+        except Exception:
+            return key
+
+    def clear_cache(self):
+        self._cache.clear()

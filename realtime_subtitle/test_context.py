@@ -86,11 +86,12 @@ def case_zero_turns():
 
 
 def case_glossary():
+    """P2：术语表注入（完整用例见 test_glossary.py）"""
     c = TranslationContext(max_turns=0,
                            glossary={"Stark Industries": "斯塔克工业"})
     p = c.build_prompt("He works at Stark Industries.")
     ok = p is not None and "Stark Industries = 斯塔克工业" in p
-    print(f"  术语表注入: {ok} （P2 预留，当前为空时该段不出现）")
+    print(f"  术语表注入: {ok}（无历史也能注入，靠 is not None 判空）")
     return ok
 
 
@@ -166,19 +167,19 @@ def case_real_llm_path():
 if __name__ == "__main__":
     results = []
     print("P1 回归：严格有界翻译上下文")
-    print("\n[1/7] 首句无历史 -> 简版 prompt")
+    print("\n[1/8] 首句无历史 -> 简版 prompt")
     results.append(case_empty_history())
-    print("\n[2/7] 历史严格有界")
+    print("\n[2/8] 历史严格有界")
     results.append(case_bounded())
-    print("\n[3/7] prompt 同时含原文与已上屏译文")
+    print("\n[3/8] prompt 同时含原文与已上屏译文")
     results.append(case_prompt_has_both())
-    print("\n[4/7] 场景重置")
+    print("\n[4/8] 场景重置")
     results.append(case_reset())
-    print("\n[5/7] 关闭上下文（0 句）")
+    print("\n[5/8] 关闭上下文（0 句）")
     results.append(case_zero_turns())
-    print("\n[6/7] 术语表注入（P2 预留）")
+    print("\n[6/8] 术语表注入")
     results.append(case_glossary())
-    print("\n[7/7] 与翻译线程集成")
+    print("\n[7/8] 与翻译线程集成")
     results.append(case_worker_integration())
     print("\n[8/8] 真实 LLM 代码路径（本地 mock 接口）")
     results.append(case_real_llm_path())
