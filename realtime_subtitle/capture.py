@@ -28,7 +28,8 @@ BLOCK_FRAMES = CAPTURE_SR * BLOCK_MS // 1000
 SPEECH_ENTRY_FRAMES = 2     # 连续 2 帧有人声 => 一句话开始
 SILENCE_EXIT_FRAMES = 4     # 连续 4 帧无人声（0.4s）=> 一句话结束
 MIN_SEGMENT_FRAMES = 5      # 短于 0.5s 的段丢弃（过滤误触发的碎片）
-MAX_SEGMENT_FRAMES = 90     # 单句最长 9s，强制切分（避免长段连成一串）
+MAX_SEGMENT_FRAMES = 50     # 单句最长 5s 强制切分：连续说话不停顿时也能及时出一次译文
+                            # （原来是 9s，说话密时会憋很久才看到翻译）
 RING16_FRAMES = 8           # 最近 8 个 16k 块（0.8s）作为预卷缓冲
 SILENT_RMS = 1e-4           # 低于此值视为"没声音"（语音通常 0.01~0.2，静音底噪约 1e-12）
 

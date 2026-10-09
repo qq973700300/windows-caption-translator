@@ -26,6 +26,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from collections import deque
 from tkinter import ttk, messagebox
 
 # 模块目录：始终指向代码所在位置（打包后为 _MEIPASS 内部）
@@ -70,6 +71,7 @@ DEFAULT_CONFIG = {
     "llm_api_key": "",
     "llm_model": "",
     "context_turns": 3,           # 给 LLM 参考的历史句数（0 = 关闭，仅 LLM 引擎有效）
+    "keep_prev_dst": True,        # 预览时保留上一条译文（否则下一句一开口译文就被清空）
 }
 
 
@@ -114,7 +116,9 @@ ENGINES = {"自动（免费在线回退链）": "auto", "Google 翻译": "google
 # 给 LLM 参考的历史句数（仅 LLM 引擎有效；免费引擎是单句接口，拿不到上下文）
 CTX_TURNS = {"关闭（每句独立）": 0, "1 句": 1, "2 句": 2, "3 句": 3, "5 句": 5}
 
-SUB_DURATION = 9.0  # 字幕停留秒数
+SUB_DURATION = 9.0      # 无新内容多久后淡出（秒）
+MIN_SUB_HOLD = 2.5      # 每条字幕最短停留时间：上一条没看够就不换，新句子排队等待
+HISTORY_MAX = 300       # 历史记录最多保留多少条
 
 # ---------------------------------------------------------------------------
 # 字幕窗尺寸（固定，不随文本长短变化）
@@ -202,7 +206,7 @@ class SubtitleOverlay(tk.Toplevel):
         self.dst_label.pack(padx=20, pady=(2, 10), fill="x")
 
         # 关闭/拖动小提示条（右下角）
-        tip = tk.Label(self, text="按住拖动 | 双击关闭", font=("Microsoft YaHei UI", 8),
+        tip = tk.Label(self, text="按住拖动 | 双击看历史", font=("Microsoft YaHei UI", 8),
                        fg="#666670", bg="#101014")
         tip.pack(side="bottom", anchor="e", padx=8, pady=2)
 
@@ -218,7 +222,7 @@ class SubtitleOverlay(tk.Toplevel):
         for widget in (self, self.src_label, self.dst_label):
             widget.bind("<Button-1>", self._on_press)
             widget.bind("<B1-Motion>", self._on_move)
-            widget.bind("<Double-Button-1>", lambda e: self.master.event_generate("<<close-overlay>>"))
+            widget.bind("<Double-Button-1>", lambda e: self.master._open_history())
 
         if x >= 0 and y >= 0:
             self.geometry(f"+{x}+{y}")
@@ -236,16 +240,21 @@ class SubtitleOverlay(tk.Toplevel):
     def _on_move(self, e):
         self.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
-    def set_subtitle(self, src, dst, partial=False):
-        # partial：边说边出的实时预览，末尾加 … 且颜色略淡，成句后会被完整版替换
+    def set_subtitle(self, src, dst, partial=False, keep_dst=False):
+        """partial：边说边出的实时预览，末尾加 … 且颜色略淡，成句后会被完整版替换
+
+        keep_dst：预览时**不动译文行**。否则下一句话刚开口，上一条译文
+        就被清空了——这正是"还没看清就被顶掉"的主因。
+        """
         self.src_label.config(
             text=fit_lines(src + ("  …" if partial else ""), self._src_f,
                            SUB_WIDTH - 40, SRC_LINES),
             fg="#a8a8b0" if partial else "#c8c8c8")
-        self.dst_label.config(
-            text=fit_lines(dst if dst else "", self._dst_f,
-                           SUB_WIDTH - 40, DST_LINES),
-            fg="#ffe9a8" if partial else "#ffd54a")
+        if dst or not keep_dst:
+            self.dst_label.config(
+                text=fit_lines(dst if dst else "", self._dst_f,
+                               SUB_WIDTH - 40, DST_LINES),
+                fg="#ffe9a8" if partial else "#ffd54a")
         self.deiconify()
 
     def clear(self):
@@ -259,7 +268,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("实时视频翻译字幕")
-        self.geometry("480x560")
+        self.geometry("480x600")
         self.resizable(False, False)
         self.configure(bg="#f5f5f7")
         self._load_font_fallback()
@@ -279,9 +288,18 @@ class App(tk.Tk):
         self.running = False
         self._last_sub_time = 0
         self._stats = {"sentences": 0}
+        # 字幕历史（可回看）+ 最短停留保护
+        self.history = []            # [(时间, 原文, 译文)]，只记成句
+        self._pending = deque()      # 排队等待上屏的成句（上一条没看够时不立刻覆盖）
+        self._shown_at = 0.0         # 当前这条是什么时候上屏的
+        self._hist_win = None
+        self._hist_text = None
+        self._hist_follow = None
+        self._hist_count = None
+        self._poll_job = None
 
         self._build_ui()
-        self.after(120, self._poll)
+        self._poll_job = self.after(120, self._poll)
 
     def _load_font_fallback(self):
         try:
@@ -305,6 +323,8 @@ class App(tk.Tk):
         self.start_btn.grid(row=0, column=0, padx=6)
         self.stop_btn = ttk.Button(btnf, text="■ 停止", width=14, command=self.stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, padx=6)
+        ttk.Button(btnf, text="≡ 历史记录", width=12,
+                   command=self._open_history).grid(row=0, column=2, padx=6)
 
         # 音量指示
         volf = ttk.LabelFrame(frm, text=" 系统声音音量（播放视频时应跳动） ")
@@ -316,6 +336,12 @@ class App(tk.Tk):
         ttk.Checkbutton(
             frm, text="实时预览（边说边出字幕，关闭则整句说完再显示）",
             variable=self.preview_var,
+            command=self._save_now).pack(anchor="w", **pad)
+
+        self.keep_dst_var = tk.BooleanVar(value=bool(self.cfg.get("keep_prev_dst", True)))
+        ttk.Checkbutton(
+            frm, text="预览时保留上一条译文（每条至少停留 2.5 秒，看完才换）",
+            variable=self.keep_dst_var,
             command=self._save_now).pack(anchor="w", **pad)
 
         ttk.Label(frm, text="识别灵敏度（背景音大则调低）").pack(anchor="w", **pad)
@@ -388,6 +414,7 @@ class App(tk.Tk):
                   justify="left").pack(anchor="w", padx=8, pady=(0, 6))
 
         self.bind("<<close-overlay>>", lambda e: self.stop())
+        self.bind("<Control-h>", lambda e: self._open_history())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_devices()
 
@@ -468,6 +495,108 @@ class App(tk.Tk):
                   justify="left").pack(anchor="w")
         ttk.Button(frm, text="关闭", command=win.destroy).pack(anchor="e", pady=(6, 0))
 
+    # -------------------------------------------------------- 字幕历史
+    def _open_history(self):
+        """字幕历史窗口：向上翻滚回看前面说过的话
+
+        独立窗口而不是加高字幕窗 —— 字幕窗尺寸是固定的（长句短句都不跳动），
+        把历史塞进去会破坏这一点。
+        """
+        if self._hist_win is not None and self._hist_win.winfo_exists():
+            self._hist_win.lift()
+            self._hist_win.focus_force()
+            return
+        win = tk.Toplevel(self)
+        win.title("字幕历史")
+        win.geometry("660x520")
+        win.configure(bg="#f5f5f7")
+        self._hist_win = win
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=10, pady=8)
+        ttk.Button(top, text="复制全部", command=self._copy_history).pack(side="left")
+        ttk.Button(top, text="清空", command=self._clear_history).pack(side="left", padx=6)
+        self._hist_follow = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="自动滚动到最新",
+                        variable=self._hist_follow).pack(side="left", padx=8)
+        self._hist_count = tk.StringVar(value=f"共 {len(self.history)} 条")
+        ttk.Label(top, textvariable=self._hist_count,
+                  foreground="#666").pack(side="right")
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        txt = tk.Text(body, wrap="word", undo=False, font=("Microsoft YaHei UI", 11),
+                      bg="#1c1c20", fg="#e8e8e8", insertbackground="#e8e8e8",
+                      relief="flat", padx=10, pady=8, spacing1=2, spacing3=8)
+        sb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        txt.tag_config("time", foreground="#7a7a88", font=("Microsoft YaHei UI", 9))
+        txt.tag_config("src", foreground="#9fb4c7")
+        txt.tag_config("dst", foreground="#ffd54a",
+                       font=("Microsoft YaHei UI", 12, "bold"))
+        self._hist_text = txt
+        for item in self.history:
+            self._append_history_ui(item)
+        txt.configure(state="disabled")
+
+        ttk.Label(win, text="双击字幕窗 或 按 Ctrl+H 打开。取消「自动滚动到最新」"
+                           "后，可以停在历史里慢慢看，新字幕不会把你拽回底部。",
+                  foreground="#888", font=("Microsoft YaHei UI", 8),
+                  wraplength=620, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", self._close_history)
+
+    def _append_history_ui(self, item):
+        txt = self._hist_text
+        if txt is None:
+            return
+        try:
+            txt.winfo_exists()
+        except Exception:
+            return
+        ts, src, dst = item
+        txt.configure(state="normal")
+        txt.insert("end", f"[{ts}] ", "time")
+        txt.insert("end", (src or "") + "\n", "src")
+        txt.insert("end", (dst or "") + "\n", "dst")
+        txt.configure(state="disabled")
+        if self._hist_follow is not None and self._hist_follow.get():
+            txt.see("end")
+        if self._hist_count is not None:
+            self._hist_count.set(f"共 {len(self.history)} 条")
+
+    def _close_history(self):
+        if self._hist_win is not None:
+            try:
+                self._hist_win.destroy()
+            except Exception:
+                pass
+        self._hist_win = None
+        self._hist_text = None
+        self._hist_follow = None
+        self._hist_count = None
+
+    def _clear_history(self):
+        self.history.clear()
+        txt = self._hist_text
+        if txt is not None:
+            try:
+                txt.configure(state="normal")
+                txt.delete("1.0", "end")
+                txt.configure(state="disabled")
+            except Exception:
+                pass
+        if self._hist_count is not None:
+            self._hist_count.set("共 0 条")
+
+    def _copy_history(self):
+        if not self.history:
+            return
+        body = "\n".join(f"{s}\n{d}" for _ts, s, d in self.history if (s or d))
+        self.clipboard_clear()
+        self.clipboard_append(body)
+
     def _refresh_devices(self):
         """填充音频来源下拉框（音频输出设备列表）"""
         self._devices = {"系统默认输出设备": ""}
@@ -499,6 +628,7 @@ class App(tk.Tk):
         self.cfg["translate_engine"] = ENGINES.get(self.eng_cb.get(), "auto")
         self.cfg["sensitivity"] = round(float(self.sens_var.get()), 2)
         self.cfg["preview"] = bool(self.preview_var.get())
+        self.cfg["keep_prev_dst"] = bool(self.keep_dst_var.get())
         if hasattr(self, "_devices"):
             self.cfg["device_id"] = self._devices.get(self.device_cb.get(), "")
         self.cfg["llm_base_url"] = self.llm_url.get().strip()
@@ -532,6 +662,8 @@ class App(tk.Tk):
         self.disp_queue = queue.Queue()
         self._seq = 0
         self._last_final_seq = 0
+        self._pending.clear()        # 清掉上次残留的待上屏字幕
+        self._shown_at = 0.0
         self._start_translator()
         try:
             self.segmenter = AudioSegmenter(
@@ -585,6 +717,7 @@ class App(tk.Tk):
         if not self.running:
             return
         self.running = False
+        self._pending.clear()
         if self.trans_q:
             self.trans_q.stop()
             self.trans_q = None
@@ -745,7 +878,12 @@ class App(tk.Tk):
                     if final and seq >= 0:
                         self._last_final_seq = seq
                     self._last_sub_time = time.time()
-                    self._show_subtitle(src, dst, partial=not final)
+                    if final:
+                        self._enqueue_final(src, dst)
+                    elif not self._pending:
+                        # 预览只在没有排队等待的译文时才更新原文行，
+                        # 否则会把刚上屏、还没看清的译文顶掉
+                        self._show_subtitle(src, None, partial=True)
                     engine_name = "LLM" if self.cfg["translate_engine"] == "llm" else "在线"
                     tag = "成句" if final else "实时"
                     done = self.trans_q.done if self.trans_q else 0
@@ -762,11 +900,46 @@ class App(tk.Tk):
                         self.status_var.set(item[1] + self._silent_hint())
         except queue.Empty:
             pass
+        self._flush_pending()          # 到点了就把排队的那条放上屏
         # 字幕淡出
         if self.overlay and self._last_sub_time and time.time() - self._last_sub_time > SUB_DURATION:
             self.overlay.clear()
             self._last_sub_time = 0
-        self.after(120, self._poll)
+            self._shown_at = 0         # 已经淡出过，下一条不用再等停留时间
+        self._poll_job = self.after(120, self._poll)
+
+    # ---------------------------------------------------- 字幕停留与历史
+    def _enqueue_final(self, src, dst):
+        """成句译文入队。不立刻上屏，由 _flush_pending 决定什么时候放出来"""
+        if not (src or dst):
+            return
+        self._pending.append((src, dst))
+        while len(self._pending) > 5:      # 极端积压时丢最旧的，绝不无限堆积
+            self._pending.popleft()
+        self._flush_pending()
+
+    def _flush_pending(self):
+        """最短停留保护：上一条没看够 MIN_SUB_HOLD 秒就不换，新句子排队等着
+
+        没有这层的话，说话一密，字幕就是"来一条盖一条"，上一句根本来不及看清。
+        """
+        if not self._pending:
+            return
+        if self._shown_at and time.time() - self._shown_at < MIN_SUB_HOLD:
+            return
+        src, dst = self._pending.popleft()
+        self._show_subtitle(src, dst, partial=False)
+        self._shown_at = time.time()
+        self._record_history(src, dst)
+
+    def _record_history(self, src, dst):
+        """成句才记历史（预览不记，否则一条句子会被拆成十几条）"""
+        if not (src or dst):
+            return
+        self.history.append((time.strftime("%H:%M:%S"), src or "", dst or ""))
+        if len(self.history) > HISTORY_MAX:
+            del self.history[:len(self.history) - HISTORY_MAX]
+        self._append_history_ui(self.history[-1])
 
     def _silent_hint(self):
         """长时间没采到声音 -> 很可能是「音频来源」选错了设备
@@ -786,7 +959,8 @@ class App(tk.Tk):
     def _show_subtitle(self, src, dst, partial=False):
         if self.overlay:
             try:
-                self.overlay.set_subtitle(src, dst or "", partial)
+                keep = partial and bool(self.cfg.get("keep_prev_dst", True))
+                self.overlay.set_subtitle(src, dst, partial, keep_dst=keep)
             except Exception:
                 pass
 
