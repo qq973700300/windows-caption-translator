@@ -6,6 +6,7 @@
   * google：deep-translator（translate.google.com，开了系统代理时可用）
 - 可选 LLM：OpenAI 兼容接口（DeepSeek / 智谱 / 通义等均可），配置后优先使用
 """
+import json
 import logging
 import time
 
@@ -108,7 +109,7 @@ class Translator:
         r.raise_for_status()
         return "".join(x[0] for x in r.json()[0] if x and x[0])
 
-    def _llm(self, text, src_lang, context=None):
+    def _llm(self, text, src_lang, context=None, on_delta=None):
         base = self.llm_config.get("base_url", "").rstrip("/")
         key = self.llm_config.get("api_key", "")
         model = self.llm_config.get("model", "")
@@ -140,20 +141,54 @@ class Translator:
         # 所以只在 DeepSeek 域名下发送。
         if self.no_think and "deepseek" in base:
             payload["thinking"] = {"type": "disabled"}
+        # 流式接收：译文还没生成完就把已生成的部分交给调用方（观感上快 0.2s，
+        # 而且是逐字浮现）。实测 DeepSeek 首字 0.62s、全文 0.79s。
+        if on_delta is not None:
+            payload["stream"] = True
         resp = requests.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
             json=payload,
             timeout=self.timeout,
+            stream=on_delta is not None,
         )
         resp.raise_for_status()
-        out = resp.json()["choices"][0]["message"]["content"].strip()
-        logger.debug("LLM 翻译（上下文=%s）: %s -> %s", use_ctx, text[:20], out[:20])
+        if on_delta is None:
+            out = resp.json()["choices"][0]["message"]["content"].strip()
+            logger.debug("LLM 翻译（上下文=%s）: %s -> %s", use_ctx, text[:20], out[:20])
+            return out
+
+        acc = ""
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            s = line.decode("utf-8", errors="ignore")
+            if not s.startswith("data:"):
+                continue
+            data = s[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(data)
+            except Exception:
+                continue
+            for choice in chunk.get("choices", []):
+                delta = (choice.get("delta") or {}).get("content") or ""
+                if delta:
+                    acc += delta
+                    try:
+                        on_delta(acc.strip())
+                    except Exception:
+                        pass            # UI 出问题不影响翻译本身
+        out = acc.strip()
+        logger.debug("LLM 流式翻译（上下文=%s）: %s -> %s", use_ctx, text[:20], out[:20])
         return out
 
     # ------------------------------------------------------------------
-    def translate(self, text, src_lang=None, context=None):
+    def translate(self, text, src_lang=None, context=None, on_delta=None):
         """带缓存与回退的翻译入口。失败返回 None（UI 显示原文）
+
+        on_delta: 可选回调，收到一段译文就调用一次（流式浮现，仅 LLM 引擎）
 
         context: TranslationContext，仅 LLM 引擎会用到（其他引擎是单句接口）
         """
@@ -186,7 +221,8 @@ class Translator:
                 try:
                     t0 = time.time()
                     if eng == "llm":
-                        result = self._llm(text, src_lang, context=context)
+                        result = self._llm(text, src_lang, context=context,
+                                           on_delta=on_delta)
                     elif eng == "transmart":
                         result = self._transmart(text, src_lang)
                     elif eng == "mymemory":

@@ -280,6 +280,13 @@ class SubtitleOverlay(tk.Toplevel):
                 fg="#ffd54a")
         self.deiconify()
 
+    def set_partial_dst(self, dst):
+        """流式译文：只更新下面那行大字，不动上面的原文行"""
+        self.dst_label.config(
+            text=fit_lines(dst, self._dst_f, SUB_WIDTH - 40, DST_LINES),
+            fg="#ffd54a")
+        self.deiconify()
+
     def clear(self):
         # 清空也保持同样的行数，框体尺寸不变
         self.src_label.config(text="\n" * (SRC_LINES - 1), fg="#c8c8c8")
@@ -309,6 +316,7 @@ class App(tk.Tk):
         self.glossary.load()
         self._seq = 0                # 成句序号，防止慢翻译回来覆盖新句子
         self._last_final_seq = 0
+        self._shown_seq = 0          # 当前屏幕上这条字幕的序号（译文逐字浮现用）
         self.running = False
         self.mono = False            # True = 不翻译，只把识别原文放大显示
         self._last_partial = ""      # 上一次推给 UI 的实时增量文本（去重/节流用）
@@ -767,6 +775,7 @@ class App(tk.Tk):
         self.disp_queue = queue.Queue()
         self._seq = 0
         self._last_final_seq = 0
+        self._shown_seq = 0          # 当前屏幕上这条字幕的序号（译文逐字浮现用）
         self._pending.clear()        # 清掉上次残留的待上屏字幕
         self._shown_at = 0.0
         self.mono = (self.cfg.get("translate_engine") == "none")
@@ -933,7 +942,7 @@ class App(tk.Tk):
                 self._seq += 1
                 if self.trans_q:
                     # 说完立刻把原文顶上去，译文留空等翻译线程回填
-                    self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
+                    self.disp_queue.put(("subtitle", text, "", 0.0, False, self._seq))
                     # 整句一次翻译。分块只该发生在显示环节（fit_lines 已负责截断）。
                     self.trans_q.submit(self._seq, text)
                 else:
@@ -982,6 +991,16 @@ class App(tk.Tk):
         try:
             while True:
                 item = self.disp_queue.get_nowait()
+                if item[0] == "partial_dst":
+                    # 译文正在流式生成：只在这条字幕已经在屏幕上时才往里填，
+                    # 否则会被"上一句还没看完"的保护逻辑冲掉
+                    if item[1] == self._shown_seq and self.overlay:
+                        try:
+                            self.overlay.set_partial_dst(item[2])
+                        except Exception:
+                            pass
+                        self._last_sub_time = time.time()
+                    continue
                 if item[0] == "partial":
                     if self.overlay:
                         try:
@@ -1001,11 +1020,13 @@ class App(tk.Tk):
                         self._last_final_seq = seq
                     self._last_sub_time = time.time()
                     if final:
-                        self._enqueue_final(src, dst, mono)
+                        self._enqueue_final(src, dst, mono, seq)
                     elif not self._pending:
                         # 原文先上屏（译文还在翻）。队列里还有没放出来的译文时
                         # 不抢，否则会把刚上屏、还没看清的那条顶掉
                         self._show_subtitle(src, "", mono)
+                        if seq >= 0:
+                            self._shown_seq = seq   # 之后的流式译文就填在这一条上
                     if self.cfg["translate_engine"] == "none":
                         engine_name = "无（只识别）"
                     elif self.cfg["translate_engine"] == "llm":
@@ -1037,11 +1058,11 @@ class App(tk.Tk):
         self._poll_job = self.after(120, self._poll)
 
     # ---------------------------------------------------- 字幕停留与历史
-    def _enqueue_final(self, src, dst, mono=False):
+    def _enqueue_final(self, src, dst, mono=False, seq=-1):
         """成句译文入队。不立刻上屏，由 _flush_pending 决定什么时候放出来"""
         if not (src or dst):
             return
-        self._pending.append((src, dst, mono))
+        self._pending.append((src, dst, mono, seq))
         while len(self._pending) > 5:      # 极端积压时丢最旧的，绝不无限堆积
             self._pending.popleft()
         self._flush_pending()
@@ -1055,8 +1076,9 @@ class App(tk.Tk):
             return
         if self._shown_at and time.time() - self._shown_at < MIN_SUB_HOLD:
             return
-        src, dst, mono = self._pending.popleft()
+        src, dst, mono, seq = self._pending.popleft()
         self._show_subtitle(src, dst, mono)
+        self._shown_seq = seq
         self._shown_at = time.time()
         self._record_history(src, dst)
 

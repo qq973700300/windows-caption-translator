@@ -85,7 +85,7 @@ class SpyTranslator:
     def __init__(self):
         self.calls = []
 
-    def translate(self, text, src_lang=None, context=None):
+    def translate(self, text, src_lang=None, context=None, on_delta=None):
         # 签名必须跟 Translator 一致（worker 总是传 context 关键字）
         self.calls.append(text)
         time.sleep(0.2)

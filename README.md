@@ -114,6 +114,7 @@ python -m venv .venv
 |---|---|
 | 说话开始 → 首个字出现在小字行 | **约 0.7s** |
 | 单块解码 | 约 9ms（RTF 0.09） |
+| 译文开始浮现（流式接收） | 提交后 **约 0.6s** 出首字，逐字长出来 |
 | 说完 → 大字行定稿 | 句末静音 1.2s（`rule2`）后 |
 | 长句（超过 8s） | 到点后等 0.8s 自然停顿收句 |
 
@@ -246,9 +247,19 @@ He told me he would bring it.
 不用改代码 —— 软件本来就走 OpenAI 兼容接口，本地服务填进去即可。
 
 ```bash
-# 1) 装 Ollama：https://ollama.com 下载 Windows 安装包
-# 2) 拉模型（RTX 3080 10GB 推荐 8B，约 5GB 显存）
+# 1) 装 Ollama：https://ollama.com/download/windows
+# 2) 拉模型（RTX 3080 10GB 推荐 8B，Q4_K_M 约 5.2GB）
 ollama pull qwen3:8b
+```
+
+国内 `ollama pull` 太慢时，先用魔搭下 GGUF 再导入（可用下载工具断点续传）：
+
+```bash
+# ModelScope 直连，约 4.7GB
+curl -L -o Qwen3-8B-Q4_K_M.gguf ^
+  "https://modelscope.cn/api/v1/models/Qwen/Qwen3-8B-GGUF/repo?FilePath=Qwen3-8B-Q4_K_M.gguf"
+# Modelfile 内容： FROM ./Qwen3-8B-Q4_K_M.gguf
+ollama create qwen3:8b -f Modelfile
 ```
 
 然后界面里填：

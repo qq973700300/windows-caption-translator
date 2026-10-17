@@ -117,9 +117,21 @@ class TranslationWorker:
             dst = src                      # 识别出来就是中文：直接显示
         else:
             t0 = time.time()
+
+            # 流式浮现：译文边生成边往 UI 送，屏幕上是"逐字长出来"而不是
+            # 等 0.9 秒后整句蹦出来。只有 LLM 引擎支持（机翻是一次性返回）
+            def _on_delta(part):
+                self.out.put(("partial_dst", seq, part))
+
+            delta_cb = _on_delta if getattr(self.tr, "engine", "") == "llm" else None
             # 上下文只对 LLM 引擎有效；其他引擎是单句接口，传了也用不上
-            dst = self.tr.translate(src, src_lang=self.src_lang,
-                                    context=self.ctx) or ""
+            try:
+                dst = self.tr.translate(src, src_lang=self.src_lang,
+                                        context=self.ctx, on_delta=delta_cb) or ""
+            except TypeError:
+                # 第三方/桩翻译器可能不接受 on_delta，退回普通调用
+                dst = self.tr.translate(src, src_lang=self.src_lang,
+                                        context=self.ctx) or ""
             logger.info("翻译 seq=%d 用时 %.2fs → %s",
                         seq, time.time() - t0, (dst or "")[:30])
         if self.ctx is not None:

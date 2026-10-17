@@ -28,7 +28,7 @@ class SlowTranslator:
         self.delay = delay
         self.calls = []
 
-    def translate(self, text, src_lang=None, context=None):
+    def translate(self, text, src_lang=None, context=None, on_delta=None):
         self.calls.append(text)
         time.sleep(self.delay)
         return "译：" + text

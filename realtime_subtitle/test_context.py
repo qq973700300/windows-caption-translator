@@ -29,7 +29,7 @@ class FastTranslator:
     def __init__(self):
         self.calls = []
 
-    def translate(self, text, src_lang=None, context=None):
+    def translate(self, text, src_lang=None, context=None, on_delta=None):
         self.calls.append((text, context is not None))
         return "译" + text[-3:]
 
