@@ -28,8 +28,11 @@ BLOCK_FRAMES = CAPTURE_SR * BLOCK_MS // 1000
 SPEECH_ENTRY_FRAMES = 2     # 连续 2 帧有人声 => 一句话开始
 SILENCE_EXIT_FRAMES = 4     # 连续 4 帧无人声（0.4s）=> 一句话结束
 MIN_SEGMENT_FRAMES = 5      # 短于 0.5s 的段丢弃（过滤误触发的碎片）
-MAX_SEGMENT_FRAMES = 50     # 单句最长 5s 强制切分：连续说话不停顿时也能及时出一次译文
-                            # （原来是 9s，说话密时会憋很久才看到翻译）
+# 单句长度上限。注意策略是"到点后先找自然停顿，找不到才硬切"：
+# 曾经直接按 5s 硬切，实测会把长句从中间劈开（"...and explain" + "why this ..."），
+# 半句去翻译译文必然不通顺，而且切断还会连带劣化识别（matters -> matter）。
+MAX_SEGMENT_FRAMES = 80     # 8s：到这个长度开始"待切"，有停顿就切
+GRACE_FRAMES = 30           # 待切后最多再等 3s 找停顿，超过才硬切（延迟上限 ~11s）
 RING16_FRAMES = 8           # 最近 8 个 16k 块（0.8s）作为预卷缓冲
 SILENT_RMS = 1e-4           # 低于此值视为"没声音"（语音通常 0.01~0.2，静音底噪约 1e-12）
 
@@ -42,7 +45,12 @@ def list_output_devices():
 class AudioSegmenter(threading.Thread):
     """后台线程：loopback 采集 + Silero VAD 切句，把音频块推进流式队列"""
 
-    def __init__(self, stream_queue, sensitivity=1.0, device_id=None):
+    def __init__(self, stream_queue, sensitivity=1.0, device_id=None,
+                 max_frames=None):
+        """
+        max_frames: 单句最长多少帧（100ms/帧）后进入"待切"，None 用默认值。
+                    值越大越不容易切断长句，代价是译文出得越晚。
+        """
         super().__init__(daemon=True)
         # 元素为 ("start", [预卷16k块...]) / ("audio", 16k块) / ("end", None) / ("cancel", None)
         self.stream_queue = stream_queue
@@ -58,6 +66,8 @@ class AudioSegmenter(threading.Thread):
         self._silence_run = 0
         self._speech_run = 0
         self._silent_run = 0        # 连续"没声音"的帧数（用于提示选错了设备）
+        self._overrun = 0           # 超过长度上限后又说了多少帧
+        self._max_frames = int(max_frames) if max_frames else MAX_SEGMENT_FRAMES
         self._silero = self._init_silero()
         # 供测试/调试观察每次切句：on_event(kind)
         self.on_event = None
@@ -125,11 +135,16 @@ class AudioSegmenter(threading.Thread):
         self._speech_frames += 1
         if speech:
             self._silence_run = 0
-            if self._speech_frames >= MAX_SEGMENT_FRAMES:
-                self._end_utterance()      # 太长，强制切一刀
         else:
             self._silence_run += 1
+            # 静音退出优先：哪怕已经超时，也要**在停顿处切**，这样句子才是完整的
             if self._silence_run >= SILENCE_EXIT_FRAMES:
+                self._end_utterance()
+                return
+        # 超时保护：到了上限不立刻切，先等一个自然停顿；等太久才硬切
+        if self._speech_frames >= self._max_frames:
+            self._overrun += 1
+            if self._overrun >= GRACE_FRAMES:
                 self._end_utterance()
 
     # ------------------------------------------------------------------
@@ -141,6 +156,7 @@ class AudioSegmenter(threading.Thread):
         self._speech_frames = 0
         self._speech_run = 0
         self._silence_run = 0
+        self._overrun = 0
         self._in_speech = False
         self._silero.reset()      # 一句话结束，清空 LSTM 状态
 

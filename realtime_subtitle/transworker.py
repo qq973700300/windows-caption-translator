@@ -22,6 +22,8 @@ import queue
 import threading
 import time
 
+from textutil import normalize_for_mt
+
 logger = logging.getLogger("subtitle")
 
 
@@ -109,17 +111,19 @@ class TranslationWorker:
                 time.sleep(self.min_gap)
 
     def _handle(self, seq, text):
+        # 识别输出是全小写无标点的裸文本，先规整再送翻译（观感和译文质量都更好）
+        src = normalize_for_mt(text)
         if self.is_zh is not None and self.is_zh(text):
-            dst = text                     # 识别出来就是中文：直接显示
+            dst = src                      # 识别出来就是中文：直接显示
         else:
             t0 = time.time()
             # 上下文只对 LLM 引擎有效；其他引擎是单句接口，传了也用不上
-            dst = self.tr.translate(text, src_lang=self.src_lang,
+            dst = self.tr.translate(src, src_lang=self.src_lang,
                                     context=self.ctx) or ""
             logger.info("翻译 seq=%d 用时 %.2fs → %s",
                         seq, time.time() - t0, (dst or "")[:30])
         if self.ctx is not None:
-            self.ctx.add(text, dst)        # 记入历史，供下一句参考
+            self.ctx.add(src, dst)         # 记入历史，供下一句参考
         self.done += 1
         # 带上原文一起回 UI：即使中间被预览字幕覆盖，最终显示的 src/dst 也是配对的
-        self.out.put(("subtitle", text, dst, 0.0, True, seq))
+        self.out.put(("subtitle", src, dst, 0.0, True, seq))

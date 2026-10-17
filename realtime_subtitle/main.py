@@ -39,7 +39,7 @@ LOG_PATH = os.path.join(BASE_DIR, "subtitle.log")
 
 sys.path.insert(0, _MODULE_DIR)
 
-from textutil import group_pieces, looks_chinese, is_garbage  # noqa: E402
+from textutil import looks_chinese, is_garbage               # noqa: E402
 from glossary import Glossary                                 # noqa: E402
 
 # 日志落盘；若目录不可写（如装在 Program Files）则退到临时目录，不阻断启动
@@ -72,6 +72,7 @@ DEFAULT_CONFIG = {
     "llm_model": "",
     "context_turns": 3,           # 给 LLM 参考的历史句数（0 = 关闭，仅 LLM 引擎有效）
     "keep_prev_dst": True,        # 预览时保留上一条译文（否则下一句一开口译文就被清空）
+    "max_segment_sec": 8.0,       # 单句最长几秒后开始找停顿收句（超时保护）
 }
 
 
@@ -343,6 +344,13 @@ class App(tk.Tk):
             frm, text="预览时保留上一条译文（每条至少停留 2.5 秒，看完才换）",
             variable=self.keep_dst_var,
             command=self._save_now).pack(anchor="w", **pad)
+
+        ttk.Label(frm, text="最长句长（秒）：说话不停顿时多久强制出一次译文").pack(anchor="w", **pad)
+        self.maxseg_var = tk.DoubleVar(value=float(self.cfg.get("max_segment_sec", 8.0)))
+        ttk.Scale(frm, from_=4.0, to=15.0, variable=self.maxseg_var,
+                  command=lambda v: None).pack(fill="x", **pad)
+        ttk.Label(frm, text="调大=句子更完整但译文出得晚；调小=更快但可能把长句切断",
+                  foreground="#888", font=("Microsoft YaHei UI", 8)).pack(anchor="w", **pad)
 
         ttk.Label(frm, text="识别灵敏度（背景音大则调低）").pack(anchor="w", **pad)
         self.sens_var = tk.DoubleVar(value=float(self.cfg["sensitivity"]))
@@ -627,6 +635,7 @@ class App(tk.Tk):
         self.cfg["source_lang"] = LANGS.get(self.lang_cb.get(), "auto")
         self.cfg["translate_engine"] = ENGINES.get(self.eng_cb.get(), "auto")
         self.cfg["sensitivity"] = round(float(self.sens_var.get()), 2)
+        self.cfg["max_segment_sec"] = round(float(self.maxseg_var.get()), 1)
         self.cfg["preview"] = bool(self.preview_var.get())
         self.cfg["keep_prev_dst"] = bool(self.keep_dst_var.get())
         if hasattr(self, "_devices"):
@@ -668,7 +677,8 @@ class App(tk.Tk):
         try:
             self.segmenter = AudioSegmenter(
                 self.stream_queue, sensitivity=self.cfg["sensitivity"],
-                device_id=self.cfg.get("device_id", "") or None)
+                device_id=self.cfg.get("device_id", "") or None,
+                max_frames=int(float(self.cfg.get("max_segment_sec", 8.0)) * 10))
         except Exception as e:
             log.exception("采集器启动失败: %s", e)
             messagebox.showerror("错误", f"音频采集启动失败: {e}")
@@ -799,13 +809,16 @@ class App(tk.Tk):
                     self._stats["sentences"] += 1
                     # 先立刻把完整的原文顶上去（不带 …），译文留空等翻译线程回填
                     self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
-                    for sent in (group_pieces([text]) or [text]):
-                        self._seq += 1
-                        if self.trans_q:
-                            self.trans_q.submit(self._seq, sent)
-                        else:                       # 翻译线程没起来：至少显示原文
-                            self.disp_queue.put(
-                                ("subtitle", sent, "", 0.0, True, self._seq))
+                    # 整句一次翻译。
+                    # 曾经在这里用 group_pieces 按**显示宽度**把整句切成几块逐块翻译，
+                    # 结果翻译引擎拿到的是半句话（"...and explain" / "why this ..."），
+                    # 译文必然不通顺。分块只该发生在显示环节（fit_lines 已负责截断）。
+                    self._seq += 1
+                    if self.trans_q:
+                        self.trans_q.submit(self._seq, text)
+                    else:                           # 翻译线程没起来：至少显示原文
+                        self.disp_queue.put(
+                            ("subtitle", text, "", 0.0, True, self._seq))
                     continue
                 # ---- audio：边说边出（只滚原文，不翻译） ----
                 # 注意：必须先喂音频给流式引擎，再决定要不要显示。

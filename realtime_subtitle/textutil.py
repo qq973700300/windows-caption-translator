@@ -103,6 +103,28 @@ def looks_chinese(text):
     return cjk_ratio(text) > 0.5
 
 
+_I_ALONE = re.compile(r"(^|[\s\"])i([\s.,!?'\"]|$)")
+
+
+def normalize_for_mt(text):
+    """把语音识别输出规整成机器翻译吃得下的样子
+
+    流式 ASR 通常输出**全小写、无标点**的裸文本（这是模型特性，不是 bug），
+    直接喂给机器翻译引擎容易翻得生硬甚至理解错语气。这里做最小规整：
+    首字母大写、孤立的 i -> I、句末补句号。中文原样返回。
+
+    只在**送翻译前**用；显示用的原文也用它，观感更好。
+    """
+    s = (text or "").strip()
+    if not s or cjk_ratio(s) > 0.3:
+        return s
+    s = _I_ALONE.sub(r"\1I\2", s)
+    s = s[0].upper() + s[1:] if s else s
+    if s[-1] not in ".?!。？！…":
+        s += "."
+    return s
+
+
 def is_garbage(text):
     """过滤重复字符型幻觉（如 වවවවව / ʕᴗᴗᴗᴗᴗ）——静音或噪声上的典型产物"""
     s = "".join(text.split())
