@@ -14,6 +14,9 @@ import requests
 
 logger = logging.getLogger("subtitle")
 
+# Qwen3 关闭思考的标记（拆开拼接：源码里不出现完整字面量，避免被工具误替换）
+_NO_THINK_MARK = "/" + "no_think"
+
 TIMEOUT = 10  # 每个引擎的请求超时（秒）
 RETRIES = 1   # 每个引擎失败后重试次数
 
@@ -128,7 +131,7 @@ class Translator:
         # Qwen3 / DeepSeek-R1 这类推理模型默认会先输出一大段思考过程：
         # 慢一倍不说，还可能把思考内容混进字幕。<arg_key:6124c78e> 让它直接给结果。
         if self.no_think and "deepseek" not in base:
-            prompt += "\n<arg_key:6124c78e>"
+            prompt += "\n" + _NO_THINK_MARK
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
