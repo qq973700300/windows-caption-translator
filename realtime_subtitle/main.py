@@ -64,15 +64,15 @@ DEFAULT_CONFIG = {
     "translate_engine": "auto",       # auto / google / mymemory / llm
     "sensitivity": 1.0,               # 0.5 - 3.0，越大越灵敏
     "device_id": "",                  # 音频输出设备（空 = 系统默认）
-    "preview": True,                  # 边说边出字幕（关闭则整句说完才显示）
     "subtitle_x": -1,                 # 字幕窗位置（-1 居中）
     "subtitle_y": -1,
     "llm_base_url": "",
     "llm_api_key": "",
     "llm_model": "",
     "context_turns": 3,           # 给 LLM 参考的历史句数（0 = 关闭，仅 LLM 引擎有效）
-    "keep_prev_dst": True,        # 预览时保留上一条译文（否则下一句一开口译文就被清空）
     "max_segment_sec": 8.0,       # 单句最长几秒后开始找停顿收句（超时保护）
+    "llm_no_think": True,         # 给 prompt 追加 <arg_key:6124c78e>（Qwen3 等思考型模型）
+    "llm_timeout": 30,            # LLM 请求超时（本地模型首次加载慢，10s 不够）
 }
 
 
@@ -88,7 +88,8 @@ def load_config():
     except Exception:
         pass
     # 清理已废弃的旧方案配置项
-    for dead in ("model_size", "compute_device", "vad_engine", "asr_engine"):
+    for dead in ("model_size", "compute_device", "vad_engine", "asr_engine",
+                 "preview", "keep_prev_dst"):
         cfg.pop(dead, None)
     return cfg
 
@@ -116,6 +117,7 @@ ENGINES = {"自动（免费在线回退链）": "auto", "Google 翻译": "google
            "MyMemory": "mymemory", "LLM API (OpenAI兼容)": "llm"}
 # 给 LLM 参考的历史句数（仅 LLM 引擎有效；免费引擎是单句接口，拿不到上下文）
 CTX_TURNS = {"关闭（每句独立）": 0, "1 句": 1, "2 句": 2, "3 句": 3, "5 句": 5}
+LLM_TIMEOUTS = {"10 秒": 10, "30 秒": 30, "60 秒": 60, "120 秒": 120}
 
 SUB_DURATION = 9.0      # 无新内容多久后淡出（秒）
 MIN_SUB_HOLD = 2.5      # 每条字幕最短停留时间：上一条没看够就不换，新句子排队等待
@@ -241,21 +243,19 @@ class SubtitleOverlay(tk.Toplevel):
     def _on_move(self, e):
         self.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
-    def set_subtitle(self, src, dst, partial=False, keep_dst=False):
-        """partial：边说边出的实时预览，末尾加 … 且颜色略淡，成句后会被完整版替换
+    def set_subtitle(self, src, dst):
+        """dst 为空 = 译文还没回来：只更新原文行，**保留**屏幕上已有的译文
 
-        keep_dst：预览时**不动译文行**。否则下一句话刚开口，上一条译文
-        就被清空了——这正是"还没看清就被顶掉"的主因。
+        否则"原文先上屏、译文几秒后回填"这段时间里，屏幕上是一条没译文的
+        空字幕，正好把还没看清的上一条给顶掉了。
         """
         self.src_label.config(
-            text=fit_lines(src + ("  …" if partial else ""), self._src_f,
-                           SUB_WIDTH - 40, SRC_LINES),
-            fg="#a8a8b0" if partial else "#c8c8c8")
-        if dst or not keep_dst:
+            text=fit_lines(src, self._src_f, SUB_WIDTH - 40, SRC_LINES),
+            fg="#c8c8c8")
+        if dst:
             self.dst_label.config(
-                text=fit_lines(dst if dst else "", self._dst_f,
-                               SUB_WIDTH - 40, DST_LINES),
-                fg="#ffe9a8" if partial else "#ffd54a")
+                text=fit_lines(dst, self._dst_f, SUB_WIDTH - 40, DST_LINES),
+                fg="#ffd54a")
         self.deiconify()
 
     def clear(self):
@@ -348,18 +348,6 @@ class App(tk.Tk):
         self.level_canvas = tk.Canvas(volf, height=14, bg="#e8e8ec", highlightthickness=0)
         self.level_canvas.pack(fill="x", padx=8, pady=6)
 
-        self.preview_var = tk.BooleanVar(value=bool(self.cfg.get("preview", True)))
-        ttk.Checkbutton(
-            frm, text="实时预览（边说边出字幕，关闭则整句说完再显示）",
-            variable=self.preview_var,
-            command=self._save_now).pack(anchor="w", **pad)
-
-        self.keep_dst_var = tk.BooleanVar(value=bool(self.cfg.get("keep_prev_dst", True)))
-        ttk.Checkbutton(
-            frm, text="预览时保留上一条译文（每条至少停留 2.5 秒，看完才换）",
-            variable=self.keep_dst_var,
-            command=self._save_now).pack(anchor="w", **pad)
-
         ttk.Label(frm, text="最长句长（秒）：说话不停顿时多久强制出一次译文").pack(anchor="w", **pad)
         self.maxseg_var = tk.DoubleVar(value=float(self.cfg.get("max_segment_sec", 8.0)))
         ttk.Scale(frm, from_=4.0, to=15.0, variable=self.maxseg_var,
@@ -417,9 +405,30 @@ class App(tk.Tk):
         ttk.Label(llmf, text="把最近几句原文+译文一起给模型参考，代词/人名更连贯",
                   foreground="#666", font=("Microsoft YaHei UI", 8)).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=6)
+        # 本地模型（Ollama / LM Studio）适配
+        self.no_think_var = tk.BooleanVar(value=bool(self.cfg.get("llm_no_think", True)))
+        ttk.Checkbutton(
+            llmf, text="关闭思考模式（Qwen3 / R1 等推理模型必勾）",
+            variable=self.no_think_var,
+            command=self._save_now).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
+        ttk.Label(llmf, text="不勾的话模型会先把思考过程写出来：慢一倍，还可能混进字幕",
+                  foreground="#888", font=("Microsoft YaHei UI", 8),
+                  wraplength=430, justify="left").grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=6)
+        self.timeout_cb = ttk.Combobox(llmf, state="readonly",
+                                       values=list(LLM_TIMEOUTS.keys()), width=10)
+        ttk.Label(llmf, text="超时").grid(row=7, column=0, sticky="e", padx=6, pady=3)
+        self.timeout_cb.grid(row=7, column=1, sticky="w", padx=6, pady=3)
+        self.timeout_cb.set(
+            self._key_of(LLM_TIMEOUTS, int(self.cfg.get("llm_timeout", 30))))
+        self.timeout_cb.bind("<<ComboboxSelected>>", lambda e: self._save_now())
+        ttk.Label(llmf, text="本地模型首次加载要十几秒，30 秒比较稳",
+                  foreground="#888", font=("Microsoft YaHei UI", 8)).grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=6)
         # 术语表（P2）：发现某个译法不对，直接加一条，命中时强制沿用
         gf = ttk.Frame(llmf)
-        gf.grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
+        gf.grid(row=9, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
         ttk.Button(gf, text="术语表…", command=self._open_glossary).pack(side="left")
         self.glossary_var = tk.StringVar(value=self._glossary_hint())
         ttk.Label(gf, textvariable=self.glossary_var, foreground="#666",
@@ -667,8 +676,8 @@ class App(tk.Tk):
         self.cfg["translate_engine"] = ENGINES.get(self.eng_cb.get(), "auto")
         self.cfg["sensitivity"] = round(float(self.sens_var.get()), 2)
         self.cfg["max_segment_sec"] = round(float(self.maxseg_var.get()), 1)
-        self.cfg["preview"] = bool(self.preview_var.get())
-        self.cfg["keep_prev_dst"] = bool(self.keep_dst_var.get())
+        self.cfg["llm_no_think"] = bool(self.no_think_var.get())
+        self.cfg["llm_timeout"] = LLM_TIMEOUTS.get(self.timeout_cb.get(), 30)
         if hasattr(self, "_devices"):
             self.cfg["device_id"] = self._devices.get(self.device_cb.get(), "")
         self.cfg["llm_base_url"] = self.llm_url.get().strip()
@@ -741,7 +750,9 @@ class App(tk.Tk):
                        "model": self.cfg["llm_model"]}
         lang = self.cfg.get("source_lang", "auto")
         tr = Translator(engine=self.cfg["translate_engine"],
-                        target_lang="zh-CN", llm_config=llm_cfg)
+                        target_lang="zh-CN", llm_config=llm_cfg,
+                        timeout=int(self.cfg.get("llm_timeout", 30)),
+                        no_think=bool(self.cfg.get("llm_no_think", True)))
         turns = int(self.cfg.get("context_turns", 3) or 0)
         # 每次开始都重新读一遍术语表（编辑器可能刚改过）
         self.glossary.load()
@@ -786,9 +797,13 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 流式循环
     def _loop_streaming(self):
-        """真流式：每 100ms 一块持续喂给流式引擎，边说边出字幕"""
+        """真流式：每 100ms 一块持续喂给流式引擎
+
+        注意"流式"只体现在**识别**：音频边来边解码，说完立刻拿到整句。
+        显示上不做中间态 —— 说话过程中不刷字幕，一句话判定完成后才上屏
+        （中间态原文的价值很低，反而会顶掉还没看清的上一条译文）。
+        """
         import asr_stream
-        from streaming import LocalAgreement
 
         if not asr_stream.available():
             self.disp_queue.put(
@@ -810,9 +825,6 @@ class App(tk.Tk):
             return
 
         self.disp_queue.put(("status", "流式引擎已就绪（延迟约 1 秒），正在监听视频声音……"))
-        la = LocalAgreement()
-        last_committed = ""
-        last_preview = ""
 
         while self.running:
             try:
@@ -823,22 +835,16 @@ class App(tk.Tk):
             try:
                 if kind == "start":
                     engine.start(payload)      # 新的一句话，带上预卷音频
-                    la.reset()
-                    last_committed = ""
                     continue
                 if kind == "cancel":
                     engine.reset()             # 太短的段，判定为误触发，丢弃
-                    la.reset()
-                    last_committed = ""
                     continue
                 if kind == "end":
                     text = engine.finish().strip()
-                    la.reset()
-                    last_committed = ""
                     if self._bad(text):
                         continue
                     self._stats["sentences"] += 1
-                    # 先立刻把完整的原文顶上去（不带 …），译文留空等翻译线程回填
+                    # 说完立刻把原文顶上去，译文留空等翻译线程回填
                     self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
                     # 整句一次翻译。
                     # 曾经在这里用 group_pieces 按**显示宽度**把整句切成几块逐块翻译，
@@ -851,26 +857,10 @@ class App(tk.Tk):
                         self.disp_queue.put(
                             ("subtitle", text, "", 0.0, True, self._seq))
                     continue
-                # ---- audio：边说边出（只滚原文，不翻译） ----
-                # 注意：必须先喂音频给流式引擎，再决定要不要显示。
-                # 关掉预览只是"不显示"，不能连音频都不喂，否则引擎收不到数据。
-                t0 = time.time()
-                text = engine.feed(payload).strip()
-                asr_ms = (time.time() - t0) * 1000
-                if self._bad(text):
-                    continue
-                committed, _pending = la.update(text)
-                last_committed = committed
-                if not self.cfg.get("preview", True):
-                    continue
-                # LocalAgreement 仍维护定稿状态（P1 的暂译会用到），
-                # 但不再拿它触发翻译 —— 否则一句长句会打 5~10 次 API
-                committed, _pending = la.update(text)
-                last_committed = committed
-                if text == last_preview:
-                    continue
-                last_preview = text
-                self.disp_queue.put(("subtitle", text, "", asr_ms, False, -1))
+                # ---- audio：持续喂给流式引擎，但**不显示中间结果** ----
+                # 喂音频这一步不能省（引擎靠它积累上下文），只是不再把半成品
+                # 文字推给 UI：中间态会顶掉还没看清的上一条译文，价值很低。
+                engine.feed(payload)
             except Exception as e:
                 log.exception("流式处理出错: %s", e)
 
@@ -925,9 +915,9 @@ class App(tk.Tk):
                     if final:
                         self._enqueue_final(src, dst)
                     elif not self._pending:
-                        # 预览只在没有排队等待的译文时才更新原文行，
-                        # 否则会把刚上屏、还没看清的译文顶掉
-                        self._show_subtitle(src, None, partial=True)
+                        # 原文先上屏（译文还在翻）。队列里还有没放出来的译文时
+                        # 不抢，否则会把刚上屏、还没看清的那条顶掉
+                        self._show_subtitle(src, "")
                     engine_name = "LLM" if self.cfg["translate_engine"] == "llm" else "在线"
                     tag = "成句" if final else "实时"
                     done = self.trans_q.done if self.trans_q else 0
@@ -972,7 +962,7 @@ class App(tk.Tk):
         if self._shown_at and time.time() - self._shown_at < MIN_SUB_HOLD:
             return
         src, dst = self._pending.popleft()
-        self._show_subtitle(src, dst, partial=False)
+        self._show_subtitle(src, dst)
         self._shown_at = time.time()
         self._record_history(src, dst)
 
@@ -1000,11 +990,10 @@ class App(tk.Tk):
             pass
         return ""
 
-    def _show_subtitle(self, src, dst, partial=False):
+    def _show_subtitle(self, src, dst):
         if self.overlay:
             try:
-                keep = partial and bool(self.cfg.get("keep_prev_dst", True))
-                self.overlay.set_subtitle(src, dst, partial, keep_dst=keep)
+                self.overlay.set_subtitle(src, dst)
             except Exception:
                 pass
 

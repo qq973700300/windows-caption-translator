@@ -81,39 +81,42 @@ def case_queue_no_loss():
     return ok
 
 
-def case_preview_keeps_translation():
-    """预览（下一句刚开口）不能把上一条还没看清的译文清空"""
+def case_pending_src_keeps_translation():
+    """原文先上屏、译文还在翻的时候，不能把上一条译文清空
+
+    字幕流程是：说完 -> 原文立刻上屏（译文空）-> 几百毫秒后译文回填。
+    这中间如果清空译文行，屏幕上就是一条没译文的空字幕，正好把还没看清的
+    上一条顶掉。
+    """
     app = _app()
     try:
         app._enqueue_final("done sentence", "上一句译文")
         before = app.overlay.dst_label.cget("text")
-        app._show_subtitle("next sentence is being spoken", None, partial=True)
-        after = app.overlay.dst_label.cget("text")
+        app._show_subtitle("next sentence just finished", "")
+        mid = app.overlay.dst_label.cget("text")
         src = app.overlay.src_label.cget("text")
-        ok_keep = ("上一句译文" in before and "上一句译文" in after
-                   and "next sentence" in src)
-        # 关掉开关后恢复旧行为（立即清空译文）
-        app.cfg["keep_prev_dst"] = False
-        app._show_subtitle("another", None, partial=True)
-        off = app.overlay.dst_label.cget("text")
-        ok = ok_keep and off.strip() == ""
-        print(f"  预览时保留译文: {'上一句译文' in after} | "
-              f"关掉开关后清空: {off.strip() == ''}")
+        # 译文回填后才替换
+        app._show_subtitle("next sentence just finished", "下一句译文")
+        done = app.overlay.dst_label.cget("text")
+        ok = ("上一句译文" in before and "上一句译文" in mid
+              and "next sentence" in src and "下一句译文" in done)
+        print(f"  原文先上屏时保留上一条译文: {'上一句译文' in mid} | "
+              f"回填后替换: {'下一句译文' in done}")
     finally:
         _close(app)
     return ok
 
 
 def case_history_records():
-    """只有成句进历史；预览不进（否则一句话会被拆成十几条）"""
+    """只记真正上屏（带译文）的成句；只上原文不记"""
     M.MIN_SUB_HOLD = 0.0          # 关掉停留等待，两条都能立刻上屏
     app = _app()
     try:
         app._enqueue_final("a", "甲")
-        app._show_subtitle("a is being spoken now", None, partial=True)
+        app._show_subtitle("a just finished", "")   # 只上原文，不该进历史
         app._enqueue_final("b", "乙")
         ok = len(app.history) == 2 and app.history[0][2] == "甲" and app.history[1][2] == "乙"
-        print(f"  成句 2 条 + 预览 1 次 -> 历史 {len(app.history)} 条 "
+        print(f"  成句 2 条 + 只上原文 1 次 -> 历史 {len(app.history)} 条 "
               f"{[h[2] for h in app.history]}")
     finally:
         _close(app)
@@ -224,8 +227,8 @@ if __name__ == "__main__":
     results.append(case_min_hold())
     print("\n[2/6] 排队不丢字幕")
     results.append(case_queue_no_loss())
-    print("\n[3/6] 预览不清空上一条译文")
-    results.append(case_preview_keeps_translation())
+    print("\n[3/6] 译文未回填时不清空上一条译文")
+    results.append(case_pending_src_keeps_translation())
     print("\n[4/6] 历史只记成句")
     results.append(case_history_records())
     print("\n[5/6] 历史窗口（内容/复制/清空）")

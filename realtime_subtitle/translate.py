@@ -28,15 +28,19 @@ MM_SRC = {"en": "en", "en-GB": "en-GB"}
 
 class Translator:
     def __init__(self, engine="auto", target_lang="zh-CN",
-                 llm_config=None):
+                 llm_config=None, timeout=None, no_think=True):
         """
         engine: "auto"（回退链）| "google" | "mymemory" | "llm"
         target_lang: 目标语言（当前固定 zh-CN）
         llm_config: {"base_url":..., "api_key":..., "model":...}
+        timeout: LLM 请求超时（本地模型首次加载慢，默认沿用 TIMEOUT）
+        no_think: 给 prompt 追加 <arg_key:6124c78e>（Qwen3 / R1 等思考型模型需要）
         """
         self.engine = engine
         self.target = target_lang
         self.llm_config = llm_config or {}
+        self.timeout = int(timeout) if timeout else TIMEOUT
+        self.no_think = bool(no_think)
         self._cache = {}          # 文本翻译缓存
         self._fail_until = {}     # 引擎临时熔断：失败后 30s 内不再尝试
         self.last_engine = None   # 最近一次成功的引擎（供 UI 显示）
@@ -120,6 +124,10 @@ class Translator:
                 f"你是实时字幕翻译器。把下面这段语音识别文本翻译成{tgt_name}，"
                 f"只输出译文本身，不要解释、不要引号。\n\n{text}"
             )
+        # Qwen3 / DeepSeek-R1 这类推理模型默认会先输出一大段思考过程：
+        # 慢一倍不说，还可能把思考内容混进字幕。<arg_key:6124c78e> 让它直接给结果。
+        if self.no_think:
+            prompt += "\n<arg_key:6124c78e>"
         resp = requests.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
@@ -129,7 +137,7 @@ class Translator:
                 "temperature": 0.2,
                 "max_tokens": 500,
             },
-            timeout=TIMEOUT,
+            timeout=self.timeout,
         )
         resp.raise_for_status()
         out = resp.json()["choices"][0]["message"]["content"].strip()

@@ -9,15 +9,19 @@
 5) 与翻译线程集成：每翻完一句自动入历史
 6) 关闭上下文（0 句）时行为等价旧版
 """
+import json
 import os
 import queue
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from context import TranslationContext  # noqa: E402
+from context import TranslationContext    # noqa: E402
+from translate import Translator          # noqa: E402
 from transworker import TranslationWorker  # noqa: E402
 
 
@@ -28,6 +32,35 @@ class FastTranslator:
     def translate(self, text, src_lang=None, context=None):
         self.calls.append((text, context is not None))
         return "译" + text[-3:]
+
+
+class MockLLM(BaseHTTPRequestHandler):
+    """本地 OpenAI 兼容接口：记下每次收到的 prompt，返回固定译文"""
+
+    prompts = []
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        MockLLM.prompts.append(body["messages"][0]["content"])
+        data = json.dumps(
+            {"choices": [{"message": {"content": "他说他会把东西带过来。"}}]}
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *a):
+        pass
+
+
+def start_mock():
+    from http.server import HTTPServer
+    MockLLM.prompts = []
+    srv = HTTPServer(("127.0.0.1", 0), MockLLM)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 def case_empty_history():
@@ -117,31 +150,7 @@ def case_worker_integration():
 def case_real_llm_path():
     """走真实 translate._llm 代码路径：起一个本地 mock 的 OpenAI 兼容接口，
     验证发出去的 prompt 里确实带上了历史（不需要真实 API Key）"""
-    import json
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    received = []
-
-    class MockLLM(BaseHTTPRequestHandler):
-        def do_POST(self):
-            n = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n))
-            received.append(body["messages"][0]["content"])
-            data = json.dumps(
-                {"choices": [{"message": {"content": "他说他会把东西带过来。"}}]}
-            ).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, *a):
-            pass
-
-    srv = HTTPServer(("127.0.0.1", 0), MockLLM)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv = start_mock()
     port = srv.server_address[1]
 
     from translate import Translator
@@ -154,7 +163,7 @@ def case_real_llm_path():
                        src_lang="en", context=ctx)
     srv.shutdown()
 
-    sent = received[-1] if received else ""
+    sent = MockLLM.prompts[-1] if MockLLM.prompts else ""
     ok = (out == "他说他会把东西带过来。"
           and "我需要和约翰谈谈。" in sent
           and "He told me he would bring it." in sent)
@@ -162,6 +171,37 @@ def case_real_llm_path():
     print(f"  prompt 含历史译文: {'我需要和约翰谈谈。' in sent} | "
           f"含当前句: {'He told me he would bring it.' in sent}")
     return ok
+
+
+def case_llm_local_options():
+    """本地模型（Ollama / LM Studio）适配：<arg_key:6124c78e> 开关 + 可调超时"""
+    srv = start_mock()
+    tr_on = Translator(engine="llm", target_lang="zh-CN",
+                       llm_config={"base_url": f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                                   "api_key": "test", "model": "mock"},
+                       timeout=45, no_think=True)
+    tr_on._llm("Hello there.", "en")
+    p_on = MockLLM.prompts[-1]
+
+    tr_off = Translator(engine="llm", target_lang="zh-CN",
+                        llm_config={"base_url": f"http://127.0.0.1:{srv.server_address[1]}/v1",
+                                    "api_key": "test", "model": "mock"},
+                        timeout=45, no_think=False)
+    tr_off._llm("Hello there.", "en")
+    p_off = MockLLM.prompts[-1]
+    srv.shutdown()
+    ok = (p_on.endswith("\n<arg_key:6124c78e>") and "<arg_key:6124c78e>" not in p_off
+          and tr_on.timeout == 45)
+    print(f"  开: 末尾带 <arg_key:6124c78e> = {p_on.endswith(chr(10) + '<arg_key:6124c78e>')} | "
+          f"关: 不含 = {'<arg_key:6124c78e>' not in p_off} | 超时可配 = {tr_on.timeout}")
+    return ok
+
+
+def start_mock():
+    from http.server import HTTPServer
+    srv = HTTPServer(("127.0.0.1", 0), MockLLM)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 if __name__ == "__main__":
@@ -181,7 +221,9 @@ if __name__ == "__main__":
     results.append(case_glossary())
     print("\n[7/8] 与翻译线程集成")
     results.append(case_worker_integration())
-    print("\n[8/8] 真实 LLM 代码路径（本地 mock 接口）")
+    print("\n[8/9] 真实 LLM 代码路径（本地 mock 接口）")
     results.append(case_real_llm_path())
+    print("\n[9/9] 本地模型适配（<arg_key:6124c78e> 开关 + 可调超时）")
+    results.append(case_llm_local_options())
     print("\n" + "=" * 52)
     print("CONTEXT TEST:", "PASS" if all(results) else f"FAIL {results}")
