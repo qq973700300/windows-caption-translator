@@ -410,9 +410,13 @@ class App(tk.Tk):
 
         self.lang_cb.set(self._key_of(LANGS, self.cfg["source_lang"]))
         self.eng_cb.set(self._key_of(ENGINES, self.cfg["translate_engine"]))
+        # 引擎切换时顺带决定 LLM 配置区要不要露出来
+        self.eng_cb.bind("<<ComboboxSelected>>",
+                         lambda e: (self._save_now(), self._sync_llm_visibility()))
 
         # LLM 配置
-        llmf = ttk.LabelFrame(frm, text=" LLM 翻译（可选，OpenAI 兼容接口，填好后选择对应引擎） ")
+        llmf = ttk.LabelFrame(frm, text=" LLM 翻译（OpenAI 兼容接口） ")
+        self.llmf = llmf
         llmf.pack(fill="x", **pad)
         self.llm_url = ttk.Entry(llmf)
         self.llm_key = ttk.Entry(llmf, show="*")
@@ -468,7 +472,9 @@ class App(tk.Tk):
 
         # 状态
         stf = ttk.LabelFrame(frm, text=" 状态 ")
+        self.stf = stf
         stf.pack(fill="both", expand=True, **pad)
+        self._sync_llm_visibility()
         self.status_var = tk.StringVar(value="待机。点击「开始翻译」后播放视频即可。")
         ttk.Label(stf, textvariable=self.status_var, wraplength=430,
                   justify="left").pack(anchor="w", padx=8, pady=6)
@@ -481,6 +487,25 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_devices()
         self._bind_mousewheel(frm)
+
+    # ------------------------------------------------------------ 界面
+    def _sync_llm_visibility(self):
+        """只有选了 LLM 引擎才显示那一片 LLM 配置
+
+        否则选「不翻译」或机翻引擎时，接口地址 / Key / 模型名 / 上下文句数 /
+        术语表还杵在面板里，既占地方又让人误以为没生效——**这些只对 LLM 引擎
+        有意义**，机翻是单句接口，拿不到上下文和术语表。
+        """
+        llmf = getattr(self, "llmf", None)
+        stf = getattr(self, "stf", None)
+        if llmf is None or stf is None:
+            return
+        show = self.cfg.get("translate_engine") == "llm"
+        visible = bool(llmf.winfo_ismapped())
+        if show and not visible:
+            llmf.pack(fill="x", padx=14, pady=4, before=stf)
+        elif not show and visible:
+            llmf.pack_forget()
 
     def _bind_mousewheel(self, w):
         """滚轮只绑主界面这一棵控件树
