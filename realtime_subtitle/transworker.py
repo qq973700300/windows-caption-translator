@@ -153,7 +153,8 @@ class TranslationWorker:
     def _handle_chunk(self, seq, partial):
         """边说边译：新增文本攒着，够一块就翻一块并追加显示"""
         self._cur_seq = seq
-        st = self._live.setdefault(seq, {"sent": "", "pending": "", "acc": ""})
+        st = self._live.setdefault(seq, {"sent": "", "pending": "", "acc": "",
+                                         "consumed": 0})
         # 注意：这里**不能**先 normalize_for_mt —— 它会自动补句号，
         # 那样每个半成品都以句号结尾，会被误判成"一个完整句子"而逐词提交
         # （实测切出来是"这个。""病人。""报告。"）。规整只在真正提交片段时做。
@@ -165,6 +166,8 @@ class TranslationWorker:
             # ASR 回改了前缀（罕见）：只取长度增长的部分，避免重复翻译
             delta = text[len(st["sent"]):].strip() if len(text) > len(st["sent"]) else ""
         st["sent"] = text
+        # 小字行始终显示"还没翻掉的那截原文"，两行永远是同一句
+        self.out.put(("partial", text[st.get("consumed", 0):].strip()))
         if delta:
             st["pending"] = (st["pending"] + " " + delta).strip()
 
@@ -182,6 +185,8 @@ class TranslationWorker:
             if dst:
                 st["acc"] = (st["acc"] + dst).strip()
                 self.out.put(("partial_dst", seq, st["acc"]))
+                st["consumed"] = len(st["sent"])
+                self.out.put(("partial", st["sent"][st["consumed"]:].strip()))
                 logger.info("同传片段 seq=%d（%d 词）→ %s", seq, words, dst[:24])
 
     def _handle_final(self, seq, text, simul):
@@ -204,6 +209,7 @@ class TranslationWorker:
             if not dst:                     # 一句没翻出任何片段：退回整句翻译
                 dst = self._translate(src)
             self._finish(seq, src, dst)
+            self.out.put(("partial", ""))
             return
 
         if self.is_zh is not None and self.is_zh(text):

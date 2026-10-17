@@ -925,6 +925,7 @@ class App(tk.Tk):
                 # 边说边出：上面那行小字实时滚当前句（200ms 节流，文本变了才发）
                 now = time.time()
                 if (cur and cur != self._last_partial
+                        and not getattr(self, "_simul", False)
                         and now - self._last_partial_at >= 0.2):
                     self._last_partial = cur
                     self._last_partial_at = now
@@ -938,7 +939,9 @@ class App(tk.Tk):
                     if not getattr(self, "_simul_shown", False):
                         self._simul_shown = True
                         self._simul_at = 0.0
-                        self.disp_queue.put(("subtitle", cur, "", 0.0, False, live))
+                        self._shown_seq = live
+                        self.disp_queue.put(("partial", cur))
+                        self.disp_queue.put(("partial_dst", live, ""))
                     if now2 - getattr(self, "_simul_at", 0.0) >= 0.35:
                         self._simul_at = now2
                         self.trans_q.submit_simul(live, cur)
