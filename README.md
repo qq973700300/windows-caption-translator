@@ -263,6 +263,17 @@ ollama pull qwen3:8b
 | 超时 | `30 秒`（首次加载模型要十几秒） |
 | 上下文句数 / 术语表 | 照常用，本地模型同样生效 |
 
+### 云端 LLM：DeepSeek（不用装东西，按量付费）
+
+| 项 | 值 |
+|---|---|
+| 接口地址 | `https://api.deepseek.com/v1` |
+| 模型名 | `deepseek-chat`（实测 0.8~1.0s/句，比 `deepseek-flash` 快一倍） |
+| API Key | 到 https://platform.deepseek.com/api_keys 创建 |
+| 成本 | 空闲时段 ¥1/百万输入、¥4/百万输出，**约 0.3 元/小时视频** |
+
+Key 在 https://platform.deepseek.com 注册后充值再创建，只显示一次，记得立刻保存。
+
 显存参考：Qwen3-8B ≈ 6.8GB（10GB 卡甜点）、Gemma3-12B ≈ 8.5GB；
 **Qwen3-14B 约 10.8GB，超出 10GB 会掉到内存、速度暴跌，别选。**
 识别跑在 CPU（sherpa-onnx int8），显存可以全部留给翻译模型。
