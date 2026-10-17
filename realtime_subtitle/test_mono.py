@@ -16,36 +16,34 @@ import main as M  # noqa: E402
 
 
 def check_overlay():
+    """只识别模式：窗口里每条只显示原文（没有译文的第二行）"""
     root = tk.Tk()
     root.withdraw()
     ov = M.SubtitleOverlay(root, -1, -1)
+
     ov.set_subtitle("Hello there, this is a test.", "", mono=True)
-    src1 = ov.src_label.cget("text").strip()
-    dst1 = ov.dst_label.cget("text").strip()
-    ok1 = src1 == "" and "Hello there" in dst1
+    t1 = ov.txt.get("1.0", "end").strip()
+    ok1 = "Hello there" in t1 and "\n" not in t1
 
     ov.set_subtitle("Hello there.", "你好。", mono=False)
-    src2 = ov.src_label.cget("text").strip()
-    dst2 = ov.dst_label.cget("text").strip()
-    ok2 = "Hello there" in src2 and "你好" in dst2
+    t2 = ov.txt.get("1.0", "end").strip()
+    ok2 = "Hello there." in t2 and "你好。" in t2
 
-    # 实时增量：只写小字行，不动大字行
-    ov.set_subtitle("Final sentence.", "", mono=True)
+    # 正在说的那句用淡色挂在最下面，定稿后合并成一条
     ov.set_partial("Next sentence is being spoken")
-    src3 = ov.src_label.cget("text").strip()
-    dst3 = ov.dst_label.cget("text").strip()
-    ok4 = "Next sentence" in src3 and "Final sentence" in dst3
-    print(f"  增量只写小字行: {ok4} (src={src3[:24]!r} dst={dst3!r})")
+    t3 = ov.txt.get("1.0", "end").strip()
+    ok3 = "Next sentence" in t3 and t3.count("Next sentence") == 1
 
     h1 = ov.winfo_height()
     ov.set_subtitle("x" * 200, "", mono=True)
     ov.update_idletasks()
     h2 = ov.winfo_height()
-    ok3 = abs(h1 - h2) <= 1
+    ok4 = abs(h1 - h2) <= 1
     root.destroy()
-    print(f"  mono 只显示原文: {ok1} (src={src1!r} dst={dst1!r})")
+    print(f"  mono 只显示原文: {ok1}")
     print(f"  双语模式仍可用: {ok2}")
-    print(f"  窗口高度不变: {ok3} ({h1} -> {h2})")
+    print(f"  进行中那句挂最后: {ok3}")
+    print(f"  窗口高度不变: {ok4} ({h1} -> {h2})")
     return ok1 and ok2 and ok3 and ok4
 
 

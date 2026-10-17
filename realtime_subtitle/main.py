@@ -188,7 +188,17 @@ def fit_lines(text, font, max_px, n_lines):
 
 # ---------------------------------------------------------------------------
 class SubtitleOverlay(tk.Toplevel):
-    """置顶半透明悬浮字幕窗（无边框、可拖动、尺寸固定）"""
+    """置顶半透明「字幕历史」窗：一句一行往下滚，最新的在最下面
+
+    为什么改成这样：
+      原来的双行（小字原文 / 大字译文）要求两行对齐同一句，实际很难做到，
+      一边流式识别、一边整句翻译，两行永远差着半句，看着别扭。
+      现在干脆做成日志式：说完一句就追加一条（原文 + 译文），最新的在最下面，
+      往前翻还能看到刚才说了什么。
+    """
+
+    MAX_ITEMS = 3          # 窗口里保留几条（多了往上顶）
+    LINES = 6              # 固定 6 行高（3 条），长句短句都不跳动
 
     def __init__(self, master, x, y):
         super().__init__(master)
@@ -196,37 +206,37 @@ class SubtitleOverlay(tk.Toplevel):
         self.attributes("-topmost", True)
         self.attributes("-alpha", 0.82)
         self.configure(bg="#101014")
-        self.pack_propagate(False)      # 内容再多也不撑大窗口
+        self.pack_propagate(False)
 
         self._src_f = tkfont.Font(family=SRC_FONT[0], size=SRC_FONT[1])
         self._dst_f = tkfont.Font(family=DST_FONT[0], size=DST_FONT[1],
                                   weight="bold")
-        wrap = SUB_WIDTH - 40
 
-        self.src_label = tk.Label(
-            self, text="", font=self._src_f, fg="#c8c8c8", bg="#101014",
-            wraplength=wrap, justify="left", anchor="nw", height=SRC_LINES)
-        self.src_label.pack(padx=20, pady=(10, 0), fill="x")
-        self.dst_label = tk.Label(
-            self, text="", font=self._dst_f, fg="#ffd54a", bg="#101014",
-            wraplength=wrap, justify="left", anchor="nw", height=DST_LINES)
-        self.dst_label.pack(padx=20, pady=(2, 10), fill="x")
+        self.txt = tk.Text(
+            self, height=self.LINES, width=1, bg="#101014", bd=0,
+            highlightthickness=0, wrap="word", cursor="arrow",
+            padx=18, pady=10, spacing1=1, spacing3=2)
+        self.txt.pack(fill="both", expand=True)
+        self.txt.tag_configure("src", font=self._src_f, foreground="#8e8e96")
+        self.txt.tag_configure("dst", font=self._dst_f, foreground="#ffd54a")
+        self.txt.tag_configure("mono", font=self._dst_f, foreground="#f2f2f4")
+        self.txt.tag_configure("pale", font=self._src_f, foreground="#5c5c66")
+        self.txt.tag_configure("pale_dst", font=self._dst_f, foreground="#8a7b3a")
+        self.txt.configure(state="disabled")
 
-        # 关闭/拖动小提示条（右下角）
-        tip = tk.Label(self, text="按住拖动 | 双击看历史", font=("Microsoft YaHei UI", 8),
-                       fg="#666670", bg="#101014")
+        self._items = []       # 已定稿：[(src, dst, mono)]
+        self._pend = None      # 正在说的这句：(src, dst)
+
+        tip = tk.Label(self, text="按住拖动 | 双击看全部历史",
+                       font=("Microsoft YaHei UI", 8), fg="#666670", bg="#101014")
         tip.pack(side="bottom", anchor="e", padx=8, pady=2)
 
-        # 高度按固定行数算死：内容长短变化时窗口不跳动
-        padding = 10 + 2 + 10 + 4          # 各行 pack 的上下留白
-        tip_line = self._src_f.metrics("linespace")   # 提示条约一行高
-        h = (padding + SRC_LINES * self._src_f.metrics("linespace")
-             + DST_LINES * self._dst_f.metrics("linespace") + tip_line + 6)
-        self._h = int(h)
+        line = self._dst_f.metrics("linespace")
+        self._h = int(self.LINES * line + 26)
         self.geometry(f"{SUB_WIDTH}x{self._h}")
 
         self._dx = self._dy = 0
-        for widget in (self, self.src_label, self.dst_label):
+        for widget in (self, self.txt, tip):
             widget.bind("<Button-1>", self._on_press)
             widget.bind("<B1-Motion>", self._on_move)
             widget.bind("<Double-Button-1>", lambda e: self.master._open_history())
@@ -234,12 +244,14 @@ class SubtitleOverlay(tk.Toplevel):
         if x >= 0 and y >= 0:
             self.geometry(f"+{x}+{y}")
         else:
-            # 默认：屏幕底部居中
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
             self.update_idletasks()
             self.geometry(f"+{(sw - SUB_WIDTH) // 2}+{sh - self._h - 60}")
 
+        self._render()
+
+    # ------------------------------------------------------------------
     def _on_press(self, e):
         self._dx = e.x
         self._dy = e.y
@@ -247,51 +259,59 @@ class SubtitleOverlay(tk.Toplevel):
     def _on_move(self, e):
         self.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
-    def set_partial(self, src):
-        """实时增量：只更新上面那行小字（正在说的这句），不动下面定稿的大字
+    # ------------------------------------------------------------------
+    def _render(self):
+        t = self.txt
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        items = self._items[-self.MAX_ITEMS:]
+        first = True
+        for src, dst, mono in items:
+            if not first:
+                t.insert("end", "\n")
+            first = False
+            if mono or not dst:
+                t.insert("end", src, "mono" if mono else "src")
+                continue
+            t.insert("end", src + "\n", "src")
+            t.insert("end", dst, "dst")
+        if self._pend:
+            ps, pd = self._pend
+            if not first:
+                t.insert("end", "\n")
+            t.insert("end", ps, "pale")
+            if pd:
+                t.insert("end", "\n" + pd, "pale_dst")
+        t.configure(state="disabled")
+        t.see("end")
 
-        这样"边说边出字"和"上一句还能看清"不会互相打架。
-        """
-        self.src_label.config(
-            text=fit_lines(src, self._src_f, SUB_WIDTH - 40, SRC_LINES),
-            fg="#8e8e96")
+    # ---------------- 对外接口（与旧版保持一致） ----------------
+    def set_subtitle(self, src, dst, mono=False):
+        """一句话结束：追加一条，最新在最下面"""
+        if not (src or dst):
+            return
+        self._items.append((src, dst, mono))
+        self._pend = None
+        if len(self._items) > 50:          # 只留最近 50 条，防止无限长
+            self._items = self._items[-50:]
+        self._render()
         self.deiconify()
 
-    def set_subtitle(self, src, dst, mono=False):
-        """dst 为空 = 译文还没回来：只更新原文行，**保留**屏幕上已有的译文
-
-        否则"原文先上屏、译文几秒后回填"这段时间里，屏幕上是一条没译文的
-        空字幕，正好把还没看清的上一条给顶掉了。
-
-        mono=True：只识别不翻译，把原文直接放大显示在主行（小字行留空）
-        """
-        if mono:
-            self.src_label.config(text="", fg="#c8c8c8")
-            self.dst_label.config(
-                text=fit_lines(src, self._dst_f, SUB_WIDTH - 40, DST_LINES),
-                fg="#f2f2f4")
-            self.deiconify()
-            return
-        self.src_label.config(
-            text=fit_lines(src, self._src_f, SUB_WIDTH - 40, SRC_LINES),
-            fg="#c8c8c8")
-        if dst:
-            self.dst_label.config(
-                text=fit_lines(dst, self._dst_f, SUB_WIDTH - 40, DST_LINES),
-                fg="#ffd54a")
+    def set_partial(self, src):
+        """正在说的这句：用淡色挂在最下面，说完会被正式条目替换"""
+        self._pend = (src, self._pend[1] if self._pend else "")
+        self._render()
         self.deiconify()
 
     def set_partial_dst(self, dst):
-        """流式译文：只更新下面那行大字，不动上面的原文行"""
-        self.dst_label.config(
-            text=fit_lines(dst, self._dst_f, SUB_WIDTH - 40, DST_LINES),
-            fg="#ffd54a")
-        self.deiconify()
+        """边说边译：更新最后那条（淡色）的译文"""
+        self._pend = ((self._pend[0] if self._pend else ""), dst)
+        self._render()
 
     def clear(self):
-        # 清空也保持同样的行数，框体尺寸不变
-        self.src_label.config(text="\n" * (SRC_LINES - 1), fg="#c8c8c8")
-        self.dst_label.config(text="\n" * (DST_LINES - 1), fg="#ffd54a")
+        self._items = []
+        self._pend = None
+        self._render()
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +945,6 @@ class App(tk.Tk):
                 # 边说边出：上面那行小字实时滚当前句（200ms 节流，文本变了才发）
                 now = time.time()
                 if (cur and cur != self._last_partial
-                        and not getattr(self, "_simul", False)
                         and now - self._last_partial_at >= 0.2):
                     self._last_partial = cur
                     self._last_partial_at = now
@@ -940,8 +959,6 @@ class App(tk.Tk):
                         self._simul_shown = True
                         self._simul_at = 0.0
                         self._shown_seq = live
-                        self.disp_queue.put(("partial", cur))
-                        self.disp_queue.put(("partial_dst", live, ""))
                     if now2 - getattr(self, "_simul_at", 0.0) >= 0.35:
                         self._simul_at = now2
                         self.trans_q.submit_simul(live, cur)
@@ -1043,13 +1060,13 @@ class App(tk.Tk):
                         self._last_final_seq = seq
                     self._last_sub_time = time.time()
                     if final:
-                        self._enqueue_final(src, dst, mono, seq)
-                    elif not self._pending:
-                        # 原文先上屏（译文还在翻）。队列里还有没放出来的译文时
-                        # 不抢，否则会把刚上屏、还没看清的那条顶掉
-                        self._show_subtitle(src, "", mono)
+                        # 历史式字幕：说完就追加，不做停留排队（下面几条看得见）
+                        self._show_subtitle(src, dst, mono)
                         if seq >= 0:
-                            self._shown_seq = seq   # 之后的流式译文就填在这一条上
+                            self._shown_seq = seq
+                    elif self.overlay:
+                        # 译文还没回来：先把原文作为"正在说的那句"挂最下面
+                        self.overlay.set_partial(src)
                     if self.cfg["translate_engine"] == "none":
                         engine_name = "无（只识别）"
                     elif self.cfg["translate_engine"] == "llm":

@@ -166,8 +166,6 @@ class TranslationWorker:
             # ASR 回改了前缀（罕见）：只取长度增长的部分，避免重复翻译
             delta = text[len(st["sent"]):].strip() if len(text) > len(st["sent"]) else ""
         st["sent"] = text
-        # 小字行始终显示"还没翻掉的那截原文"，两行永远是同一句
-        self.out.put(("partial", text[st.get("consumed", 0):].strip()))
         if delta:
             st["pending"] = (st["pending"] + " " + delta).strip()
 
@@ -186,7 +184,6 @@ class TranslationWorker:
                 st["acc"] = (st["acc"] + dst).strip()
                 self.out.put(("partial_dst", seq, st["acc"]))
                 st["consumed"] = len(st["sent"])
-                self.out.put(("partial", st["sent"][st["consumed"]:].strip()))
                 logger.info("同传片段 seq=%d（%d 词）→ %s", seq, words, dst[:24])
 
     def _handle_final(self, seq, text, simul):
@@ -209,7 +206,6 @@ class TranslationWorker:
             if not dst:                     # 一句没翻出任何片段：退回整句翻译
                 dst = self._translate(src)
             self._finish(seq, src, dst)
-            self.out.put(("partial", ""))
             return
 
         if self.is_zh is not None and self.is_zh(text):
