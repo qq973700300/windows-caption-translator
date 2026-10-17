@@ -74,6 +74,10 @@ def main():
                         first_at = i * 0.1
                     segs.append((i * 0.1, engine.elapsed, text))
                     print(f"  [+{i*0.1:5.1f}s] {text}")
+    # 文件末尾没有静音，模型最后几个 token 还没吐出来：补 0.3s 静音再收尾
+    # （真实播放时后面自然会有静音，等价于这个操作）
+    for _ in range(3):
+        engine.accept(np.zeros(BLOCK_FRAMES, dtype=np.float32), CAPTURE_SR)
     rest = engine.finish().strip()
     if rest:
         segs.append((len(audio) / CAPTURE_SR, 0, rest))

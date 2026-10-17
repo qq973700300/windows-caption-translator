@@ -170,6 +170,15 @@ python -m venv .venv
 
 放好后重启程序，状态栏会显示当前用的模型名；`test_streaming.py` 也会打印 `(transducer)` 还是 `(paraformer)`。
 
+实测同一段 20.4s 英语（人工转写为基准）：
+
+| 模型 | WER | 输出 | 标点 | RTF |
+|---|---|---|---|---|
+| 流式 Paraformer（旧） | 8.6% | `wthem to to this channe` | 无 | 0.04 |
+| **X-ASR 480ms（现用）** | **0.0%** | `Welcome to this channel. Today we are going to…` | 自带 | 0.09 |
+
+代价是模型 566MB（fp32）、加载 2.8s，CPU 上仍是 11 倍实时。
+
 ### 异步翻译：ASR 永远不等翻译
 
 架构底线。翻译是耗时不可控的网络请求（在线引擎 0.2~0.5s，LLM 0.5~2s，慢时可达 10s），
