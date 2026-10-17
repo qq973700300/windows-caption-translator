@@ -269,8 +269,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("实时视频翻译字幕")
-        self.geometry("480x600")
-        self.resizable(False, False)
+        self.geometry("500x720")
+        self.resizable(False, True)      # 宽度固定，高度可以自己拉
+        self.minsize(500, 480)
         self.configure(bg="#f5f5f7")
         self._load_font_fallback()
 
@@ -311,8 +312,22 @@ class App(tk.Tk):
     # ----------------------------------------------------------------- UI
     def _build_ui(self):
         pad = {"padx": 14, "pady": 4}
-        frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, padx=4, pady=6)
+        # 可滚动主体：控件越来越多，而窗口高度是写死的 —— 装不下时 Tk 会把
+        # 带 expand 的控件（状态栏）压成 0 高度，看起来像"选项不见了"。
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(wrap, highlightthickness=0, bg="#f5f5f7")
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        frm = ttk.Frame(canvas)
+        _inner = canvas.create_window((0, 0), window=frm, anchor="nw")
+        frm.bind("<Configure>",
+                 lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(_inner, width=e.width))
+        self._canvas = canvas
 
         ttk.Label(frm, text="实时视频翻译字幕", font=("Microsoft YaHei UI", 15, "bold")).pack(pady=(8, 2))
         ttk.Label(frm, text="播放视频（任意播放器/网页）即可在屏幕下方出现中文翻译字幕",
@@ -425,6 +440,22 @@ class App(tk.Tk):
         self.bind("<Control-h>", lambda e: self._open_history())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_devices()
+        self._bind_mousewheel(frm)
+
+    def _bind_mousewheel(self, w):
+        """滚轮只绑主界面这一棵控件树
+
+        不用 bind_all：历史窗口等 Toplevel 是独立的控件树，绑全局会连带滚动。
+        """
+        def on_wheel(e):
+            try:
+                self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+
+        w.bind("<MouseWheel>", on_wheel)
+        for c in w.winfo_children():
+            self._bind_mousewheel(c)
 
     def _glossary_hint(self):
         n = len(self.glossary)
