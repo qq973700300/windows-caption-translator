@@ -701,7 +701,7 @@ class App(tk.Tk):
         txt.configure(state="normal")
         if getattr(self, "_hist_live", False):
             # 实时行还没定稿：正式条目来了就把它顶掉，别重复
-            txt.delete("live_mark", "end")
+            txt.delete("live_mark", "end-1c")   # end-1c：保留最后一个隐式换行
             self._hist_live = False
         txt.insert("end", f"[{ts}] ", "time")
         txt.insert("end", (src or "") + "\n", "src")
@@ -724,11 +724,11 @@ class App(tk.Tk):
             return
         txt.configure(state="normal")
         if getattr(self, "_hist_live", False):
-            txt.delete("live_mark", "end")
+            txt.delete("live_mark", "end-1c")
         else:
             txt.mark_set("live_mark", "end-1c")
             txt.mark_gravity("live_mark", "left")
-        txt.insert("end", (src or "") + "\n", "live")
+        txt.insert("end-1c", (src or "") + "\n", "live")
         self._hist_live = True
         txt.configure(state="disabled")
         if self._hist_follow is not None and self._hist_follow.get():
