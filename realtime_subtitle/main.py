@@ -642,7 +642,9 @@ class App(tk.Tk):
             return
         win = tk.Toplevel(self)
         win.title("字幕历史")
-        win.geometry("660x520")
+        win.geometry("560x420")
+        win.attributes("-topmost", True)     # 看片时浮在最上层
+        win.attributes("-alpha", 0.94)
         win.configure(bg="#f5f5f7")
         self._hist_win = win
 
@@ -786,12 +788,12 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", f"加载音频模块失败: {e}")
             return
+        # 不再弹悬浮字幕框：直接开「字幕历史」窗口，边看边往下滚
+        self.overlay = None
         try:
-            self.overlay = SubtitleOverlay(self, int(self.cfg["subtitle_x"]), int(self.cfg["subtitle_y"]))
-            self.overlay.attributes("-alpha", 0.82)
+            self._open_history()
         except Exception as e:
-            log.warning("字幕窗创建失败: %s", e)
-            self.overlay = None
+            log.warning("历史窗口打开失败: %s", e)
 
         self.stream_queue = queue.Queue(maxsize=256)   # 采集 -> 识别：100ms/块
         self.disp_queue = queue.Queue()
@@ -1121,7 +1123,6 @@ class App(tk.Tk):
         self._show_subtitle(src, dst, mono)
         self._shown_seq = seq
         self._shown_at = time.time()
-        self._record_history(src, dst)
 
     def _record_history(self, src, dst):
         """成句才记历史（预览不记，否则一条句子会被拆成十几条）"""
@@ -1148,6 +1149,7 @@ class App(tk.Tk):
         return ""
 
     def _show_subtitle(self, src, dst, mono=False):
+        self._record_history(src, dst)
         if self.overlay:
             try:
                 self.overlay.set_subtitle(src, dst, mono)

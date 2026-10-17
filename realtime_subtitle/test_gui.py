@@ -76,7 +76,7 @@ print("\n[2/2] 端到端出字幕")
 app.eng_cb.set("MyMemory")
 app.start()          # 等价于点击「开始翻译」
 app.update()
-print("started, overlay:", bool(app.overlay))
+print("started, 历史窗口:", bool(app._hist_win))
 
 
 class SpyTranslator:
@@ -107,9 +107,9 @@ print("played test speech, waiting for subtitle...")
 got_src = got_dst = None
 for _ in range(400):     # 最多等 40 秒（译文要等翻译线程回填）
     app.update()
-    if app.overlay:
-        s = app.overlay.src_label.cget("text").strip()
-        d = app.overlay.dst_label.cget("text").strip()
+    if app.history:
+        _, s, d = app.history[-1]
+        s, d = s.strip(), d.strip()
         if s:
             got_src, got_dst = s, d
         if d:            # 译文出现才算端到端通
