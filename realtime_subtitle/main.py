@@ -359,6 +359,9 @@ class App(tk.Tk):
         self.sens_var = tk.DoubleVar(value=float(self.cfg["sensitivity"]))
         ttk.Scale(frm, from_=0.5, to=3.0, variable=self.sens_var,
                   command=lambda v: None).pack(fill="x", **pad)
+        # 停留时间内置固定，不做开关：连续说话时字幕"来一条盖一条"根本没时间看
+        ttk.Label(frm, text=f"每条译文至少停留 {MIN_SUB_HOLD:g} 秒，没看够不会被下一句盖掉（内置）",
+                  foreground="#888", font=("Microsoft YaHei UI", 8)).pack(anchor="w", **pad)
 
         gridf = ttk.Frame(frm)
         gridf.pack(fill="x", **pad)
