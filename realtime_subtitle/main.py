@@ -114,7 +114,8 @@ LANGS = {
     "西班牙语": "es",
 }
 ENGINES = {"自动（免费在线回退链）": "auto", "Google 翻译": "google",
-           "MyMemory": "mymemory", "LLM API (OpenAI兼容)": "llm"}
+           "MyMemory": "mymemory", "LLM API (OpenAI兼容)": "llm",
+           "不翻译（只显示识别原文）": "none"}
 # 给 LLM 参考的历史句数（仅 LLM 引擎有效；免费引擎是单句接口，拿不到上下文）
 CTX_TURNS = {"关闭（每句独立）": 0, "1 句": 1, "2 句": 2, "3 句": 3, "5 句": 5}
 LLM_TIMEOUTS = {"10 秒": 10, "30 秒": 30, "60 秒": 60, "120 秒": 120}
@@ -243,12 +244,21 @@ class SubtitleOverlay(tk.Toplevel):
     def _on_move(self, e):
         self.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
-    def set_subtitle(self, src, dst):
+    def set_subtitle(self, src, dst, mono=False):
         """dst 为空 = 译文还没回来：只更新原文行，**保留**屏幕上已有的译文
 
         否则"原文先上屏、译文几秒后回填"这段时间里，屏幕上是一条没译文的
         空字幕，正好把还没看清的上一条给顶掉了。
+
+        mono=True：只识别不翻译，把原文直接放大显示在主行（小字行留空）
         """
+        if mono:
+            self.src_label.config(text="", fg="#c8c8c8")
+            self.dst_label.config(
+                text=fit_lines(src, self._dst_f, SUB_WIDTH - 40, DST_LINES),
+                fg="#f2f2f4")
+            self.deiconify()
+            return
         self.src_label.config(
             text=fit_lines(src, self._src_f, SUB_WIDTH - 40, SRC_LINES),
             fg="#c8c8c8")
@@ -288,6 +298,7 @@ class App(tk.Tk):
         self._seq = 0                # 成句序号，防止慢翻译回来覆盖新句子
         self._last_final_seq = 0
         self.running = False
+        self.mono = False            # True = 不翻译，只把识别原文放大显示
         self._last_sub_time = 0
         self._stats = {"sentences": 0}
         # 字幕历史（可回看）+ 最短停留保护
@@ -716,6 +727,7 @@ class App(tk.Tk):
         self._last_final_seq = 0
         self._pending.clear()        # 清掉上次残留的待上屏字幕
         self._shown_at = 0.0
+        self.mono = (self.cfg.get("translate_engine") == "none")
         self._start_translator()
         try:
             self.capture = AudioCapture(
@@ -738,6 +750,11 @@ class App(tk.Tk):
 
     def _start_translator(self):
         """启动独立翻译线程（ASR 线程只投递请求，不等结果）"""
+        if self.cfg.get("translate_engine") == "none":
+            self.trans_q = None
+            self.ctx = None
+            log.info("翻译已关闭：只显示识别原文")
+            return
         try:
             from translate import Translator
             from transworker import TranslationWorker
@@ -863,15 +880,16 @@ class App(tk.Tk):
                 if self._bad(text):
                     continue
                 self._stats["sentences"] += 1
-                # 说完立刻把原文顶上去，译文留空等翻译线程回填
-                self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
-                # 整句一次翻译。分块只该发生在显示环节（fit_lines 已负责截断）。
                 self._seq += 1
                 if self.trans_q:
+                    # 说完立刻把原文顶上去，译文留空等翻译线程回填
+                    self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
+                    # 整句一次翻译。分块只该发生在显示环节（fit_lines 已负责截断）。
                     self.trans_q.submit(self._seq, text)
-                else:                           # 翻译线程没起来：至少显示原文
+                else:
+                    # 没开翻译（或翻译线程没起来）：原文直接放大上屏
                     self.disp_queue.put(
-                        ("subtitle", text, "", 0.0, True, self._seq))
+                        ("subtitle", text, "", 0.0, True, self._seq, True))
             except Exception as e:
                 log.exception("流式处理出错: %s", e)
 
@@ -917,6 +935,7 @@ class App(tk.Tk):
                 if item[0] == "subtitle":
                     _, src, dst, asr_ms, final = item[:5]
                     seq = item[5] if len(item) > 5 else -1
+                    mono = bool(item[6]) if len(item) > 6 else False
                     # 慢翻译回来时可能已经有更新的句子上屏了，过期结果直接丢弃
                     if final and seq >= 0 and seq < self._last_final_seq:
                         continue
@@ -924,19 +943,25 @@ class App(tk.Tk):
                         self._last_final_seq = seq
                     self._last_sub_time = time.time()
                     if final:
-                        self._enqueue_final(src, dst)
+                        self._enqueue_final(src, dst, mono)
                     elif not self._pending:
                         # 原文先上屏（译文还在翻）。队列里还有没放出来的译文时
                         # 不抢，否则会把刚上屏、还没看清的那条顶掉
-                        self._show_subtitle(src, "")
-                    engine_name = "LLM" if self.cfg["translate_engine"] == "llm" else "在线"
+                        self._show_subtitle(src, "", mono)
+                    if self.cfg["translate_engine"] == "none":
+                        engine_name = "无（只识别）"
+                    elif self.cfg["translate_engine"] == "llm":
+                        engine_name = "LLM"
+                    else:
+                        engine_name = "在线"
                     tag = "成句" if final else "实时"
                     done = self.trans_q.done if self.trans_q else 0
                     pend = (self.trans_q.q.qsize() if self.trans_q else 0)
+                    progress = (f"已翻译 {done} 句（待译 {pend}） | " if self.trans_q
+                                else "（不翻译，只识别） | ")
                     self.status_var.set(
                         f"运行中 | 已识别 {self._stats['sentences']} 句 | "
-                        f"已翻译 {done} 句（待译 {pend}） | {tag} "
-                        f"识别耗时 {asr_ms:.0f}ms | 翻译: {engine_name}"
+                        + progress + f"{tag} 识别耗时 {asr_ms:.0f}ms | 翻译: {engine_name}"
                         + self._silent_hint())
                     tail = (dst or src)[:40]
                     self.last_var.set(f"最新: {tail}")
@@ -954,11 +979,11 @@ class App(tk.Tk):
         self._poll_job = self.after(120, self._poll)
 
     # ---------------------------------------------------- 字幕停留与历史
-    def _enqueue_final(self, src, dst):
+    def _enqueue_final(self, src, dst, mono=False):
         """成句译文入队。不立刻上屏，由 _flush_pending 决定什么时候放出来"""
         if not (src or dst):
             return
-        self._pending.append((src, dst))
+        self._pending.append((src, dst, mono))
         while len(self._pending) > 5:      # 极端积压时丢最旧的，绝不无限堆积
             self._pending.popleft()
         self._flush_pending()
@@ -972,8 +997,8 @@ class App(tk.Tk):
             return
         if self._shown_at and time.time() - self._shown_at < MIN_SUB_HOLD:
             return
-        src, dst = self._pending.popleft()
-        self._show_subtitle(src, dst)
+        src, dst, mono = self._pending.popleft()
+        self._show_subtitle(src, dst, mono)
         self._shown_at = time.time()
         self._record_history(src, dst)
 
@@ -1001,10 +1026,10 @@ class App(tk.Tk):
             pass
         return ""
 
-    def _show_subtitle(self, src, dst):
+    def _show_subtitle(self, src, dst, mono=False):
         if self.overlay:
             try:
-                self.overlay.set_subtitle(src, dst)
+                self.overlay.set_subtitle(src, dst, mono)
             except Exception:
                 pass
 

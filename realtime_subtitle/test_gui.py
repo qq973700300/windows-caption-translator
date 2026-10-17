@@ -58,6 +58,8 @@ print("\n[1/2] 字幕窗固定尺寸检查")
 size_ok = check_fixed_size()
 
 print("\n[2/2] 端到端出字幕")
+# 该测试固定走翻译路径（start() 会从下拉框把值写回 cfg，所以改控件而不是改 cfg）
+app.eng_cb.set("MyMemory")
 app.start()          # 等价于点击「开始翻译」
 app.update()
 print("started, overlay:", bool(app.overlay))
