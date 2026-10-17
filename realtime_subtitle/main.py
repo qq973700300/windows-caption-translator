@@ -120,6 +120,8 @@ ENGINES = {"自动（免费在线回退链）": "auto", "Google 翻译": "google
 CTX_TURNS = {"关闭（每句独立）": 0, "1 句": 1, "2 句": 2, "3 句": 3, "5 句": 5}
 LLM_TIMEOUTS = {"10 秒": 10, "30 秒": 30, "60 秒": 60, "120 秒": 120}
 
+APP_VERSION = "4.0.0"
+
 SUB_DURATION = 9.0      # 无新内容多久后淡出（秒）
 MIN_SUB_HOLD = 2.5      # 每条字幕最短停留时间：上一条没看够就不换，新句子排队等待
 HISTORY_MAX = 300       # 历史记录最多保留多少条
@@ -288,7 +290,7 @@ class SubtitleOverlay(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("实时视频翻译字幕")
+        self.title(f"实时视频翻译字幕 v{APP_VERSION}")
         self.geometry("500x720")
         self.resizable(False, True)      # 宽度固定，高度可以自己拉
         self.minsize(500, 480)
@@ -352,7 +354,10 @@ class App(tk.Tk):
                     lambda e: canvas.itemconfigure(_inner, width=e.width))
         self._canvas = canvas
 
-        ttk.Label(frm, text="实时视频翻译字幕", font=("Microsoft YaHei UI", 15, "bold")).pack(pady=(8, 2))
+        ttk.Label(frm, text="实时视频翻译字幕",
+                  font=("Microsoft YaHei UI", 15, "bold")).pack(pady=(8, 2))
+        ttk.Label(frm, text=f"v{APP_VERSION}", foreground="#9a9aa2",
+                  font=("Microsoft YaHei UI", 8)).pack()
         ttk.Label(frm, text="播放视频（任意播放器/网页）即可在屏幕下方出现中文翻译字幕",
                   foreground="#666").pack()
 

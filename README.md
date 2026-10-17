@@ -7,8 +7,9 @@
 
 ![流程](https://img.shields.io/badge/pipeline-capture%20%E2%86%92%20VAD%20%E2%86%92%20streaming%20ASR%20%E2%86%92%20translate-blue)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![识别](https://img.shields.io/badge/ASR-sherpa--onnx%20Paraformer%20(streaming)-green)
-![延迟](https://img.shields.io/badge/latency-%3C1s-orange)
+![版本](https://img.shields.io/badge/version-4.0.0-brightgreen)
+![识别](https://img.shields.io/badge/ASR-X--ASR%20480ms%20(transducer)-green)
+![延迟](https://img.shields.io/badge/%E9%A6%96%E5%AD%97%E5%BB%B6%E8%BF%9F-0.7s-orange)
 
 ---
 
@@ -16,8 +17,10 @@
 
 ### 方式 A：下载打包版（免装 Python，推荐）
 
-1. 到 [Releases](https://github.com/qq973700300/windows-caption-translator/releases) 下载最新的 `SubtitleTranslator_v*.zip`
+1. 到 [Releases](https://github.com/qq973700300/windows-caption-translator/releases) 下载最新的 `SubtitleTranslator_v4.0.0.zip`
 2. 解压到任意文件夹（建议路径不要含中文）
+3. 双击 **`get_model.bat`** 下载识别模型（X-ASR，约 600MB，中英混说 + 自带标点）
+4. 双击 `SubtitleTranslator.exe` 启动
 3. 双击 **`SubtitleTranslator.exe`** → 点「▶ 开始翻译」
 
 > - **流式识别模型（约 240MB）首次运行时自动下载**，走国内镜像，之后缓存在本地 `models\`

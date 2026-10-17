@@ -20,7 +20,9 @@ models/
 
 # 打包产物
 build/
+build_v4/
 dist/
+dist_v4/
 *.spec
 *.zip
 # 打包配置本身要提交（注释必须独占一行，gitignore 不支持行尾注释）
