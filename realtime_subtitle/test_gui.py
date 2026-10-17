@@ -21,6 +21,20 @@ WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_speech.wav"
 
 import main as M  # noqa: E402
 
+# 这个测试会真的播放声音并从 loopback 回采系统音频：如果此刻有人在放视频，
+# 采到的就是"视频声音 + 测试语音"的混合，结果全不可信。
+if os.environ.get("AUDIO_TEST_OK") != "1":
+    print("=" * 62)
+    print("⚠ 这个测试会占用声卡：向扬声器播放测试语音，再从 loopback 回采。")
+    print("  如果此刻正在播放视频/音乐，采到的音频会被混入，结果不可信。")
+    print()
+    print("  确认没有其他声音在播放后，这样运行：")
+    print("    Windows CMD :  set AUDIO_TEST_OK=1 && python test_gui.py")
+    print("    PowerShell  :  $env:AUDIO_TEST_OK=1; python test_gui.py")
+    print("    Git Bash    :  AUDIO_TEST_OK=1 python test_gui.py")
+    print("=" * 62)
+    sys.exit(2)
+
 app = M.App()
 print("App created, window title:", app.title())
 app.update()
