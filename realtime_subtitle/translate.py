@@ -126,17 +126,24 @@ class Translator:
             )
         # Qwen3 / DeepSeek-R1 这类推理模型默认会先输出一大段思考过程：
         # 慢一倍不说，还可能把思考内容混进字幕。<arg_key:6124c78e> 让它直接给结果。
-        if self.no_think:
+        if self.no_think and "deepseek" not in base:
             prompt += "\n<arg_key:6124c78e>"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 500,
+        }
+        # DeepSeek 官方的思考开关是请求体里的 thinking 字段
+        # （https://api-docs.deepseek.com/zh-cn/guides/thinking_mode）
+        # 实测：禁用 0.9s/句，开启 1.4s/句。Ollama 不认这个字段，
+        # 所以只在 DeepSeek 域名下发送。
+        if self.no_think and "deepseek" in base:
+            payload["thinking"] = {"type": "disabled"}
         resp = requests.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens": 500,
-            },
+            json=payload,
             timeout=self.timeout,
         )
         resp.raise_for_status()

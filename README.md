@@ -267,8 +267,9 @@ ollama pull qwen3:8b
 
 | 项 | 值 |
 |---|---|
-| 接口地址 | `https://api.deepseek.com/v1` |
-| 模型名 | `deepseek-chat`（实测 0.8~1.0s/句，比 `deepseek-flash` 快一倍） |
+| 接口地址 | `https://api.deepseek.com`（官方写法，不加 /v1） |
+| 模型名 | `deepseek-flash`（官方文档指定的当前 ID；旧名 `deepseek-chat` 也能用，实测同为 1 秒级） |
+| 关闭思考模式 | **勾选**（程序会按官方文档发 `thinking:{"type":"disabled"}`，实测 1.4s → 0.9s/句） |
 | API Key | 到 https://platform.deepseek.com/api_keys 创建 |
 | 成本 | 空闲时段 ¥1/百万输入、¥4/百万输出，**约 0.3 元/小时视频** |
 
