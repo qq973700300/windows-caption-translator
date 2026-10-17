@@ -672,6 +672,12 @@ class App(tk.Tk):
         txt.tag_config("src", foreground="#9fb4c7")
         txt.tag_config("dst", foreground="#ffd54a",
                        font=("Microsoft YaHei UI", 12, "bold"))
+        # 还没定稿的那句：淡蓝、斜体，说完会被正式条目替换
+        txt.tag_config("live", foreground="#8fa8bd",
+                       font=("Microsoft YaHei UI", 11, "italic"))
+        txt.mark_set("live_mark", "end-1c")
+        txt.mark_gravity("live_mark", "left")
+        self._hist_live = False
         self._hist_text = txt
         for item in self.history:
             self._append_history_ui(item)
@@ -693,6 +699,10 @@ class App(tk.Tk):
             return
         ts, src, dst = item
         txt.configure(state="normal")
+        if getattr(self, "_hist_live", False):
+            # 实时行还没定稿：正式条目来了就把它顶掉，别重复
+            txt.delete("live_mark", "end")
+            self._hist_live = False
         txt.insert("end", f"[{ts}] ", "time")
         txt.insert("end", (src or "") + "\n", "src")
         txt.insert("end", (dst or "") + "\n", "dst")
@@ -701,6 +711,28 @@ class App(tk.Tk):
             txt.see("end")
         if self._hist_count is not None:
             self._hist_count.set(f"共 {len(self.history)} 条")
+
+    def _hist_show_live(self, src):
+        """把"正在说的这句"画在历史窗口最下面（实时滚，说完被正式条目替换）"""
+        txt = getattr(self, "_hist_text", None)
+        if txt is None:
+            return
+        try:
+            if not txt.winfo_exists():
+                return
+        except Exception:
+            return
+        txt.configure(state="normal")
+        if getattr(self, "_hist_live", False):
+            txt.delete("live_mark", "end")
+        else:
+            txt.mark_set("live_mark", "end-1c")
+            txt.mark_gravity("live_mark", "left")
+        txt.insert("end", (src or "") + "\n", "live")
+        self._hist_live = True
+        txt.configure(state="disabled")
+        if self._hist_follow is not None and self._hist_follow.get():
+            txt.see("end")
 
     def _close_history(self):
         if self._hist_win is not None:
@@ -1050,6 +1082,9 @@ class App(tk.Tk):
                             self.overlay.set_partial(item[1])
                         except Exception:
                             pass
+                    else:
+                        # 没有悬浮框时：实时那句画在历史窗口最下面
+                        self._hist_show_live(item[1])
                     self._last_sub_time = time.time()
                     continue
                 if item[0] == "subtitle":
