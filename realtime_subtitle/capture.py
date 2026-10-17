@@ -69,9 +69,16 @@ class AudioCapture(threading.Thread):
     # ------------------------------------------------------------------
     def feed_block(self, mono48):
         """喂一个 100ms 的 48k 单声道块；原样送队列，不做任何切分"""
-        self.level_rms = float(np.sqrt(np.mean(mono48 * mono48)) + 1e-12)
-        self._quiet_run = self._quiet_run + 1 if self.level_rms < SILENT_RMS else 0
+        raw = float(np.sqrt(np.mean(mono48 * mono48)))
+        self.level_rms = raw + 1e-12
+        self._quiet_run = self._quiet_run + 1 if raw < SILENT_RMS else 0
         self.silent_seconds = self._quiet_run * BLOCK_MS / 1000.0
+
+        # 数字全零（系统静音/什么都没播）会让识别模型产生幻觉（实测会吐出
+        # 一整句中文），垫一点点底噪就能避开——真实 loopback 本来也有抖动。
+        if raw == 0.0:
+            mono48 = (mono48 + np.random.default_rng().standard_normal(
+                len(mono48)).astype(np.float32) * 1e-5)
 
         if self._silero is not None:
             n = len(mono48) // 3 * 3

@@ -93,6 +93,18 @@ def case_silent_hint():
     return ok
 
 
+def case_dither():
+    """数字全零必须垫底噪：识别模型吃到纯零会幻觉出一整句中文"""
+    q = queue.Queue()
+    cap = AudioCapture(q, use_vad=False)
+    cap.feed_block(np.zeros(BLOCK_FRAMES, dtype=np.float32))
+    _, blk = q.get()
+    rms = float(np.sqrt(np.mean(blk * blk)))
+    ok = rms > 0
+    print(f"  全零块 -> 实际送出的 RMS {rms:.2e}（应 >0，避免模型幻觉）")
+    return ok
+
+
 def main():
     print("Silero VAD / 采集监测")
     print("\n[1/4] 纯静音")
@@ -101,10 +113,12 @@ def main():
     b = case_speech()
     print("\n[3/4] 纯背景音乐")
     c = case_bgm_only()
-    print("\n[4/4] 没采到声音的提示")
+    print("\n[4/5] 没采到声音的提示")
     d = case_silent_hint()
+    print("\n[5/5] 数字零垫底噪")
+    e = case_dither()
     print("\n" + "=" * 52)
-    ok = all([a, b, c, d])
+    ok = all([a, b, c, d, e])
     print("VAD TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

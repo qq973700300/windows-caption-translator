@@ -29,6 +29,14 @@ def check_overlay():
     dst2 = ov.dst_label.cget("text").strip()
     ok2 = "Hello there" in src2 and "你好" in dst2
 
+    # 实时增量：只写小字行，不动大字行
+    ov.set_subtitle("Final sentence.", "", mono=True)
+    ov.set_partial("Next sentence is being spoken")
+    src3 = ov.src_label.cget("text").strip()
+    dst3 = ov.dst_label.cget("text").strip()
+    ok4 = "Next sentence" in src3 and "Final sentence" in dst3
+    print(f"  增量只写小字行: {ok4} (src={src3[:24]!r} dst={dst3!r})")
+
     h1 = ov.winfo_height()
     ov.set_subtitle("x" * 200, "", mono=True)
     ov.update_idletasks()
@@ -38,7 +46,7 @@ def check_overlay():
     print(f"  mono 只显示原文: {ok1} (src={src1!r} dst={dst1!r})")
     print(f"  双语模式仍可用: {ok2}")
     print(f"  窗口高度不变: {ok3} ({h1} -> {h2})")
-    return ok1 and ok2 and ok3
+    return ok1 and ok2 and ok3 and ok4
 
 
 def check_app_path():

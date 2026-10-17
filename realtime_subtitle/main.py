@@ -244,6 +244,16 @@ class SubtitleOverlay(tk.Toplevel):
     def _on_move(self, e):
         self.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
+    def set_partial(self, src):
+        """实时增量：只更新上面那行小字（正在说的这句），不动下面定稿的大字
+
+        这样"边说边出字"和"上一句还能看清"不会互相打架。
+        """
+        self.src_label.config(
+            text=fit_lines(src, self._src_f, SUB_WIDTH - 40, SRC_LINES),
+            fg="#8e8e96")
+        self.deiconify()
+
     def set_subtitle(self, src, dst, mono=False):
         """dst 为空 = 译文还没回来：只更新原文行，**保留**屏幕上已有的译文
 
@@ -299,6 +309,8 @@ class App(tk.Tk):
         self._last_final_seq = 0
         self.running = False
         self.mono = False            # True = 不翻译，只把识别原文放大显示
+        self._last_partial = ""      # 上一次推给 UI 的实时增量文本（去重/节流用）
+        self._last_partial_at = 0.0
         self._last_sub_time = 0
         self._stats = {"sentences": 0}
         # 字幕历史（可回看）+ 最短停留保护
@@ -865,7 +877,14 @@ class App(tk.Tk):
             if kind != "audio":
                 continue
             try:
-                engine.accept(payload, CAPTURE_SR)
+                cur = engine.accept(payload, CAPTURE_SR)
+                # 边说边出：上面那行小字实时滚当前句（200ms 节流，文本变了才发）
+                now = time.time()
+                if (cur and cur != self._last_partial
+                        and now - self._last_partial_at >= 0.2):
+                    self._last_partial = cur
+                    self._last_partial_at = now
+                    self.disp_queue.put(("partial", cur))
                 done = engine.endpoint()
                 # 长句策略：到点之后先等一个自然停顿（0.8s 没人声）再收尾，
                 # 硬上限由 engine.hard_cap 兜底，绝不从词中间劈开
@@ -877,6 +896,7 @@ class App(tk.Tk):
                     continue
 
                 text = engine.finish().strip()
+                self._last_partial = ""
                 if self._bad(text):
                     continue
                 self._stats["sentences"] += 1
@@ -932,6 +952,14 @@ class App(tk.Tk):
         try:
             while True:
                 item = self.disp_queue.get_nowait()
+                if item[0] == "partial":
+                    if self.overlay:
+                        try:
+                            self.overlay.set_partial(item[1])
+                        except Exception:
+                            pass
+                    self._last_sub_time = time.time()
+                    continue
                 if item[0] == "subtitle":
                     _, src, dst, asr_ms, final = item[:5]
                     seq = item[5] if len(item) > 5 else -1
