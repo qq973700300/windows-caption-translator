@@ -115,6 +115,7 @@ LANGS = {
 }
 ENGINES = {"自动（免费在线回退链）": "auto", "Google 翻译": "google",
            "MyMemory": "mymemory", "LLM API (OpenAI兼容)": "llm",
+           "LLM 同传（边说边译·实验）": "simul",
            "不翻译（只显示识别原文）": "none"}
 # 给 LLM 参考的历史句数（仅 LLM 引擎有效；免费引擎是单句接口，拿不到上下文）
 CTX_TURNS = {"关闭（每句独立）": 0, "1 句": 1, "2 句": 2, "3 句": 3, "5 句": 5}
@@ -508,7 +509,7 @@ class App(tk.Tk):
         stf = getattr(self, "stf", None)
         if llmf is None or stf is None:
             return
-        show = self.cfg.get("translate_engine") == "llm"
+        show = self.cfg.get("translate_engine") in ("llm", "simul")
         visible = bool(llmf.winfo_ismapped())
         if show and not visible:
             llmf.pack(fill="x", padx=14, pady=4, before=stf)
@@ -814,13 +815,16 @@ class App(tk.Tk):
             log.exception("翻译模块加载失败: %s", e)
             messagebox.showerror("错误", f"翻译模块加载失败: {e}")
             return
+        engine = self.cfg["translate_engine"]
+        # 「同传」和 LLM 走同一套接口，区别只在 ASR 侧怎么投递（分块 vs 整句）
+        tr_engine = "llm" if engine == "simul" else engine
         llm_cfg = None
-        if self.cfg["translate_engine"] == "llm" or self.cfg["llm_api_key"]:
+        if tr_engine == "llm" or self.cfg["llm_api_key"]:
             llm_cfg = {"base_url": self.cfg["llm_base_url"],
                        "api_key": self.cfg["llm_api_key"],
                        "model": self.cfg["llm_model"]}
         lang = self.cfg.get("source_lang", "auto")
-        tr = Translator(engine=self.cfg["translate_engine"],
+        tr = Translator(engine=tr_engine,
                         target_lang="zh-CN", llm_config=llm_cfg,
                         timeout=int(self.cfg.get("llm_timeout", 30)),
                         no_think=bool(self.cfg.get("llm_no_think", True)))
@@ -891,6 +895,7 @@ class App(tk.Tk):
                 self.disp_queue.put(("status", f"流式模型下载失败: {e}"))
                 return
         max_seg = float(self.cfg.get("max_segment_sec", 8.0))
+        self._simul = (self.cfg.get("translate_engine") == "simul")
         try:
             engine = asr_stream.StreamingASR(
                 num_threads=4,
@@ -924,6 +929,20 @@ class App(tk.Tk):
                     self._last_partial = cur
                     self._last_partial_at = now
                     self.disp_queue.put(("partial", cur))
+                # ---- 同传模式：边说边译 ----
+                # 每 0.35s 把当前半成品交给翻译线程，由它按「标点/8 个词」切块翻译，
+                # 翻好一块就往大字行追加一块——屏幕上只会变长，不会回改。
+                if self._simul and cur and self.trans_q:
+                    now2 = time.time()
+                    live = self._seq + 1
+                    if not getattr(self, "_simul_shown", False):
+                        self._simul_shown = True
+                        self._simul_at = 0.0
+                        self.disp_queue.put(("subtitle", cur, "", 0.0, False, live))
+                    if now2 - getattr(self, "_simul_at", 0.0) >= 0.35:
+                        self._simul_at = now2
+                        self.trans_q.submit_simul(live, cur)
+
                 done = engine.endpoint()
                 # 长句策略：到点之后先等一个自然停顿（0.8s 没人声）再收尾，
                 # 硬上限由 engine.hard_cap 兜底，绝不从词中间劈开
@@ -936,6 +955,7 @@ class App(tk.Tk):
 
                 text = engine.finish().strip()
                 self._last_partial = ""
+                self._simul_shown = False
                 if self._bad(text):
                     continue
                 self._stats["sentences"] += 1
@@ -943,8 +963,8 @@ class App(tk.Tk):
                 if self.trans_q:
                     # 说完立刻把原文顶上去，译文留空等翻译线程回填
                     self.disp_queue.put(("subtitle", text, "", 0.0, False, self._seq))
-                    # 整句一次翻译。分块只该发生在显示环节（fit_lines 已负责截断）。
-                    self.trans_q.submit(self._seq, text)
+                    # 同传模式只补尾巴（前面已经逐块翻过了），否则整句重翻
+                    self.trans_q.submit(self._seq, text, simul=self._simul)
                 else:
                     # 没开翻译（或翻译线程没起来）：原文直接放大上屏
                     self.disp_queue.put(
