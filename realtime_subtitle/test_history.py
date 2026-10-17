@@ -16,7 +16,7 @@ sys.path.insert(0, HERE)
 import numpy as np                              # noqa: E402
 
 import main as M                                # noqa: E402
-from capture import AudioSegmenter, BLOCK_FRAMES  # noqa: E402
+from capture import BLOCK_FRAMES  # noqa: E402
 
 
 def _app():
@@ -177,47 +177,24 @@ class ScriptedVAD:
         self.i = 0
 
 
-def _feed(vad, n_blocks):
-    q = queue.Queue(maxsize=4096)
-    seg = AudioSegmenter(q, sensitivity=1.0)
-    seg._silero = vad
-    marks = []
-    state = {"i": 0}
-    seg.on_event = lambda k: marks.append((k, state["i"] * 0.1))
-    for i in range(n_blocks):
-        state["i"] = i
-        seg.feed_block(np.zeros(BLOCK_FRAMES, dtype=np.float32))
-        while True:
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                break
-    return [round(t, 1) for k, t in marks if k == "end"]
+def case_hard_cap():
+    """超长句兜底：一直没人停顿时，到 hard_cap 必须收句（延迟上限）
 
-
-def case_force_split_grace():
-    """超时后不是立刻硬切，而是先等一个自然停顿（等太久才硬切）
-
-    曾经是"到点且有声音就立刻切"，实测把长句从中间劈开：
-    "...and explain" + "why this technology matters ..." 变成两半，
-    半句去翻译译文必然不通顺，识别质量也跟着下降（matters -> matter）。
+    现在的切句由 recognizer 的端点规则负责（rule1/rule2），
+    我们的 hard_cap 只是保险：防止一句话无限长，模型越拖越糊。
     """
-    from capture import MAX_SEGMENT_FRAMES, GRACE_FRAMES
-
-    # A：一直说不停 -> 到 (MAX + GRACE) 才硬切，这是延迟上限
-    ends_a = _feed(ScriptedVAD(10 ** 6), MAX_SEGMENT_FRAMES + GRACE_FRAMES + 10)
-    hard_at = (MAX_SEGMENT_FRAMES + GRACE_FRAMES) * 0.1
-
-    # B：说过上限后停顿 -> 应当在**停顿处**收句，比硬切早，句子才是完整的
-    stop_at = MAX_SEGMENT_FRAMES + 8                  # 超过上限 0.8s 后停下
-    ends_b = _feed(ScriptedVAD(stop_at), MAX_SEGMENT_FRAMES + GRACE_FRAMES + 10)
-    pause_at = (stop_at + 4) * 0.1                    # 再过 4 帧静音判定收句
-
-    ok_a = bool(ends_a) and abs(ends_a[0] - hard_at) <= 0.4
-    ok_b = bool(ends_b) and abs(ends_b[0] - pause_at) <= 0.4 and ends_b[0] < hard_at
-    print(f"  一直不停: end 在 {ends_a[:1]}（硬切上限 {hard_at:.1f}s）")
-    print(f"  超时后停顿: end 在 {ends_b[:1]}（停顿 {pause_at:.1f}s，早于硬切 -> 句子完整）")
-    return ok_a and ok_b
+    from asr_stream import StreamingASR
+    eng = StreamingASR(num_threads=2, hard_cap=2.0)
+    n, hit = 0, None
+    for i in range(30):                      # 30 块 = 3s
+        eng.accept(np.zeros(BLOCK_FRAMES, dtype=np.float32), 48000)
+        n += 1
+        if eng.endpoint():
+            hit = i * 0.1 + 0.1
+            break
+    ok = hit is not None and abs(hit - 2.0) <= 0.3
+    print(f"  硬上限 2.0s -> 实际收句在 {hit}")
+    return ok
 
 
 if __name__ == "__main__":
@@ -233,7 +210,7 @@ if __name__ == "__main__":
     results.append(case_history_records())
     print("\n[5/6] 历史窗口（内容/复制/清空）")
     results.append(case_history_window())
-    print("\n[6/6] 超长句：先等停顿，实在没有才硬切")
-    results.append(case_force_split_grace())
+    print("\n[6/6] 超长句硬上限（防止一句无限长）")
+    results.append(case_hard_cap())
     print("\n" + "=" * 52)
     print("HISTORY TEST:", "PASS" if all(results) else f"FAIL {results}")

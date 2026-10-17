@@ -277,7 +277,7 @@ class App(tk.Tk):
 
         self.cfg = load_config()
         self.overlay = None
-        self.segmenter = None
+        self.capture = None
         self.worker = None
         self.stream_queue = queue.Queue(maxsize=256)
         self.disp_queue = queue.Queue()
@@ -348,14 +348,14 @@ class App(tk.Tk):
         self.level_canvas = tk.Canvas(volf, height=14, bg="#e8e8ec", highlightthickness=0)
         self.level_canvas.pack(fill="x", padx=8, pady=6)
 
-        ttk.Label(frm, text="最长句长（秒）：说话不停顿时多久强制出一次译文").pack(anchor="w", **pad)
+        ttk.Label(frm, text="最长句长（秒）：到点后遇到停顿就收尾（避免一句拖太长）").pack(anchor="w", **pad)
         self.maxseg_var = tk.DoubleVar(value=float(self.cfg.get("max_segment_sec", 8.0)))
         ttk.Scale(frm, from_=4.0, to=15.0, variable=self.maxseg_var,
                   command=lambda v: None).pack(fill="x", **pad)
         ttk.Label(frm, text="调大=句子更完整但译文出得晚；调小=更快但可能把长句切断",
                   foreground="#888", font=("Microsoft YaHei UI", 8)).pack(anchor="w", **pad)
 
-        ttk.Label(frm, text="识别灵敏度（背景音大则调低）").pack(anchor="w", **pad)
+        ttk.Label(frm, text="断句灵敏度（往右=停顿更短就断句，句末提示音多/语速快可调高）").pack(anchor="w", **pad)
         self.sens_var = tk.DoubleVar(value=float(self.cfg["sensitivity"]))
         ttk.Scale(frm, from_=0.5, to=3.0, variable=self.sens_var,
                   command=lambda v: None).pack(fill="x", **pad)
@@ -699,7 +699,7 @@ class App(tk.Tk):
             return
         self._save_now()
         try:
-            from capture import AudioSegmenter
+            from capture import AudioCapture
         except Exception as e:
             messagebox.showerror("错误", f"加载音频模块失败: {e}")
             return
@@ -710,7 +710,7 @@ class App(tk.Tk):
             log.warning("字幕窗创建失败: %s", e)
             self.overlay = None
 
-        self.stream_queue = queue.Queue(maxsize=256)   # 流式 ASR：按 100ms 块送音频
+        self.stream_queue = queue.Queue(maxsize=256)   # 采集 -> 识别：100ms/块
         self.disp_queue = queue.Queue()
         self._seq = 0
         self._last_final_seq = 0
@@ -718,16 +718,16 @@ class App(tk.Tk):
         self._shown_at = 0.0
         self._start_translator()
         try:
-            self.segmenter = AudioSegmenter(
-                self.stream_queue, sensitivity=self.cfg["sensitivity"],
-                device_id=self.cfg.get("device_id", "") or None,
-                max_frames=int(float(self.cfg.get("max_segment_sec", 8.0)) * 10))
+            self.capture = AudioCapture(
+                self.stream_queue,
+                device_id=self.cfg.get("device_id", "") or None)
         except Exception as e:
             log.exception("采集器启动失败: %s", e)
             messagebox.showerror("错误", f"音频采集启动失败: {e}")
             return
-        self.segmenter.start()
-        log.info("切句引擎: %s", self.segmenter.vad_mode)
+        self.capture.start()
+        log.info("采集已启动（音频流常驻，切句交给 recognizer 端点检测；VAD: %s）",
+                 self.capture.vad_mode)
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
 
@@ -776,8 +776,8 @@ class App(tk.Tk):
         if self.trans_q:
             self.trans_q.stop()
             self.trans_q = None
-        if self.segmenter:
-            self.segmenter.stop()
+        if self.capture:
+            self.capture.stop()
         if self.overlay:
             x = self.overlay.winfo_x()
             y = self.overlay.winfo_y()
@@ -800,13 +800,15 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 流式循环
     def _loop_streaming(self):
-        """真流式：每 100ms 一块持续喂给流式引擎
+        """真流式：常驻音频流 + recognizer 端点检测
 
-        注意"流式"只体现在**识别**：音频边来边解码，说完立刻拿到整句。
-        显示上不做中间态 —— 说话过程中不刷字幕，一句话判定完成后才上屏
-        （中间态原文的价值很低，反而会顶掉还没看清的上一条译文）。
+        形态与官方示例一致
+        （sherpa-onnx/python-api-examples/speech-recognition-from-microphone-with-endpoint-detection.py）：
+        音频一条流喂到黑，句末只 reset 识别状态，不从重建缓冲区。
+        这样句首不会有空洞，句子也不会被 0.4s 的小停顿切碎。
         """
         import asr_stream
+        from capture import CAPTURE_SR
 
         if not asr_stream.available():
             self.disp_queue.put(
@@ -820,14 +822,22 @@ class App(tk.Tk):
                 log.exception("流式模型下载失败: %s", e)
                 self.disp_queue.put(("status", f"流式模型下载失败: {e}"))
                 return
+        max_seg = float(self.cfg.get("max_segment_sec", 8.0))
         try:
-            engine = asr_stream.StreamingASR(num_threads=4)
+            engine = asr_stream.StreamingASR(
+                num_threads=4,
+                rule2=1.2,
+                hard_cap=max(10.0, max_seg + 4.0),
+                sensitivity=float(self.cfg.get("sensitivity", 1.0)))
         except Exception as e:
             log.exception("流式引擎启动失败: %s", e)
             self.disp_queue.put(("status", f"流式引擎启动失败: {e}"))
             return
 
-        self.disp_queue.put(("status", "流式引擎已就绪（延迟约 1 秒），正在监听视频声音……"))
+        self.disp_queue.put((
+            "status",
+            f"流式引擎已就绪（{os.path.basename(engine.dir)}，"
+            f"句末静音 {engine.rule2:.1f}s），正在监听视频声音……"))
 
         while self.running:
             try:
@@ -835,35 +845,33 @@ class App(tk.Tk):
             except queue.Empty:
                 self._maybe_reset_scene()
                 continue
+            if kind != "audio":
+                continue
             try:
-                if kind == "start":
-                    engine.start(payload)      # 新的一句话，带上预卷音频
+                engine.accept(payload, CAPTURE_SR)
+                done = engine.endpoint()
+                # 长句策略：到点之后先等一个自然停顿（0.8s 没人声）再收尾，
+                # 硬上限由 engine.hard_cap 兜底，绝不从词中间劈开
+                if (not done and engine.elapsed >= max_seg
+                        and self.capture is not None
+                        and self.capture.trailing_silence >= 0.8):
+                    done = True
+                if not done:
                     continue
-                if kind == "cancel":
-                    engine.reset()             # 太短的段，判定为误触发，丢弃
+
+                text = engine.finish().strip()
+                if self._bad(text):
                     continue
-                if kind == "end":
-                    text = engine.finish().strip()
-                    if self._bad(text):
-                        continue
-                    self._stats["sentences"] += 1
-                    # 说完立刻把原文顶上去，译文留空等翻译线程回填
-                    self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
-                    # 整句一次翻译。
-                    # 曾经在这里用 group_pieces 按**显示宽度**把整句切成几块逐块翻译，
-                    # 结果翻译引擎拿到的是半句话（"...and explain" / "why this ..."），
-                    # 译文必然不通顺。分块只该发生在显示环节（fit_lines 已负责截断）。
-                    self._seq += 1
-                    if self.trans_q:
-                        self.trans_q.submit(self._seq, text)
-                    else:                           # 翻译线程没起来：至少显示原文
-                        self.disp_queue.put(
-                            ("subtitle", text, "", 0.0, True, self._seq))
-                    continue
-                # ---- audio：持续喂给流式引擎，但**不显示中间结果** ----
-                # 喂音频这一步不能省（引擎靠它积累上下文），只是不再把半成品
-                # 文字推给 UI：中间态会顶掉还没看清的上一条译文，价值很低。
-                engine.feed(payload)
+                self._stats["sentences"] += 1
+                # 说完立刻把原文顶上去，译文留空等翻译线程回填
+                self.disp_queue.put(("subtitle", text, "", 0.0, False, -1))
+                # 整句一次翻译。分块只该发生在显示环节（fit_lines 已负责截断）。
+                self._seq += 1
+                if self.trans_q:
+                    self.trans_q.submit(self._seq, text)
+                else:                           # 翻译线程没起来：至少显示原文
+                    self.disp_queue.put(
+                        ("subtitle", text, "", 0.0, True, self._seq))
             except Exception as e:
                 log.exception("流式处理出错: %s", e)
 
@@ -873,10 +881,10 @@ class App(tk.Tk):
         不清的话，上一集的人物和译法会一路带进下一集（第一集的 John
         可能和第二集的 John 不是一个人，术语也会串）。
         """
-        if self.ctx is None or self.segmenter is None:
+        if self.ctx is None or self.capture is None:
             return
         try:
-            if self.segmenter.silent_seconds >= SCENE_RESET_SEC and len(self.ctx):
+            if self.capture.silent_seconds >= SCENE_RESET_SEC and len(self.ctx):
                 sid = self.ctx.reset()
                 log.info("静音 %d 秒，翻译上下文已重置（场景 #%d）",
                          SCENE_RESET_SEC, sid)
@@ -894,8 +902,8 @@ class App(tk.Tk):
     # -------------------------------------------------------------- 轮询
     def _poll(self):
         # 音量条
-        if self.segmenter is not None and self.running:
-            rms = self.segmenter.level_rms
+        if self.capture is not None and self.running:
+            rms = self.capture.level_rms
             w = self.level_canvas.winfo_width() or 400
             self.level_canvas.delete("all")
             level = min(rms * 8.0, 1.0)
@@ -984,10 +992,10 @@ class App(tk.Tk):
         这是最容易让人以为"软件坏了"的坑：设备列表里确实有那个设备，
         但视频的声音其实从另一路出去，loopback 抓到的就是纯零。
         """
-        if not (self.running and self.segmenter):
+        if not (self.running and self.capture):
             return ""
         try:
-            if self.segmenter.silent_seconds >= 5:
+            if self.capture.silent_seconds >= 5:
                 return " | ⚠ 5 秒没采到声音：请确认「音频来源」选的是正在出声的那个设备"
         except Exception:
             pass

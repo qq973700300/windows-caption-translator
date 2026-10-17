@@ -132,22 +132,43 @@ python -m venv .venv
 ## 四、工作原理与技术架构
 
 ```
-视频/播放器 ──► 系统声音(loopback) ──► Silero VAD ──► 流式 Paraformer ──► LocalAgreement ──► 固定字幕窗
-                    capture.py            vad.py        asr_stream.py       streaming.py       main.py
-                                                                                  │
-                                        一句话说完(VAD end) ──► 翻译队列 ──► 翻译线程 ──► 回填译文
-                                                                transworker.py
+视频/播放器 ──► 系统声音(loopback) ──► 常驻音频流 ──► 流式识别 ──► 端点检测 ──► 固定字幕窗
+                    capture.py         (48k 直喂)     asr_stream.py  (recognizer)   main.py
+                                                                       │
+                                              一句话说完(端点) ──► 翻译队列 ──► 翻译线程 ──► 回填译文
+                                                                      transworker.py
 ```
 
 | 环节 | 实现 | 说明 |
 |---|---|---|
-| **声音捕获** | `capture.py` · WASAPI loopback | 抓系统正在播放的声音，本地播放器、B站、腾讯视频、Netflix 都适用 |
-| **切句（VAD）** | `vad.py` · Silero VAD（ONNX，2MB） | 神经网络直接输出"是人声"的概率，对背景音乐天然鲁棒；静音 0.4 秒判句末，最长 9 秒强切，短于 0.5 秒判误触发丢弃 |
-| **流式识别** | `asr_stream.py` · sherpa-onnx Paraformer | 维护内部状态，每 100ms 音频吐一次增量；int8 量化，CPU 上 RTF ≈ 0.04 |
-| **增量定稿** | `streaming.py` · LocalAgreement | 两次结果一致的公共前缀才算稳定；原文边说边滚，尾巴允许继续变化 |
-| **断句分块** | `textutil.py` · `group_pieces()` | 优先按句末标点收句；中文常无标点，按显示权重兜底切（约 30 汉字 / 60 西文字符一条） |
+| **声音捕获** | `capture.py` · WASAPI loopback | 抓系统正在播放的声音；只做 100ms 分块，**不切句** |
+| **流式识别** | `asr_stream.py` · sherpa-onnx OnlineRecognizer | 48k 音频直接喂进去，由 sherpa-onnx 内部重采样；int8 量化，CPU 上 RTF ≈ 0.04 |
+| **切句（端点检测）** | `asr_stream.py` · `recognizer.is_endpoint()` | 用官方端点规则：rule1=2.4s 静音（一直没人说话）、rule2=1.2s 静音（说完停一下）、rule3=12s 硬上限；8s 之后只等 0.8s 自然停顿就收句 |
+| **音频流常驻** | — | 句末只 `reset(stream)`，不重建缓冲区（这是官方示例的做法，也是不丢字的关键） |
 | **翻译（独立线程）** | `transworker.py` + `translate.py` | 见下方「异步翻译」 |
 | **界面** | `main.py` · tkinter | 控制面板 + 无边框置顶半透明字幕窗，尺寸固定、可拖动、自动淡出 |
+
+> 早先版本自己写了一套切句状态机（环形缓冲 + 预卷 + 手动 start/end 事件），
+> 实测两个硬伤：**触发判定的那块音频被丢掉**（句首 100ms 空洞，`welcome` 被识别成 `wthem`），
+> 以及**0.4s 静音就断句**（官方默认 1.2s，半句被切碎导致翻译不通顺）。
+> 现已整段删除，改为官方的「常驻流 + 端点检测」。
+
+### 换识别模型（可选，但强烈建议）
+
+程序启动时会扫描 `models\` 下的子目录，优先级：
+
+1. 目录名带 `x-asr` 的 **transducer**（中英自由混说 + 自带标点）
+2. 其他 transducer（Zipformer 系列）
+3. 兜底的流式 Paraformer（默认，无标点）
+
+**推荐：X-ASR（480ms 块，Apache-2.0）**，两种下法二选一：
+
+| 方式 | 地址 | 体积 | 放哪 |
+|---|---|---|---|
+| 镜像（快） | `https://hf-mirror.com/GilgameshWind/X-ASR-zh-en/resolve/main/deployment/models/chunk-480ms-model/` 下的 `encoder-480ms.onnx`、`decoder-480ms.onnx`、`joiner-480ms.onnx`、`tokens.txt` | ~615 MB（fp32） | `models\x-asr-480ms\`（四个文件放同一层） |
+| GitHub（省流量） | `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05.tar.bz2` | ~170 MB（int8） | 解压后整个目录放进 `models\`，目录名别改 |
+
+放好后重启程序，状态栏会显示当前用的模型名；`test_streaming.py` 也会打印 `(transducer)` 还是 `(paraformer)`。
 
 ### 异步翻译：ASR 永远不等翻译
 
@@ -156,8 +177,8 @@ python -m venv .venv
 
 | 规则 | 说明 |
 |---|---|
-| 只说定稿整句，不刷中间态 | 说话过程中不更新字幕；VAD 判定句末后整句一次上屏，每句至少停留 2.5 秒 |
-| 一句 = 一次翻译请求 | 只在 VAD 判定「这句话说完了」时入队；旧版 committed 每增长一次就翻一次，一条长句会打 5~10 次 API |
+| 只说定稿整句，不刷中间态 | 说话过程中不更新字幕；端点判定句末后整句一次上屏，每句至少停留 2.5 秒 |
+| 一句 = 一次翻译请求 | 只在判定「这句话说完了」时入队；旧版 committed 每增长一次就翻一次，一条长句会打 5~10 次 API |
 | 投递非阻塞 | ASR 线程只 `put_nowait`，队列满则丢最旧的一条，绝不等待 |
 | 结果带序号 | 慢翻译回来时若已有更新的句子上屏，过期结果直接丢弃，不会覆盖新字幕 |
 
@@ -299,9 +320,9 @@ Stark Industries = 斯塔克工业
 ├─ models\                 流式识别模型（首次运行自动下载）
 └─ realtime_subtitle/
    ├─ main.py              控制面板 + 固定尺寸悬浮字幕窗 + 字幕历史窗口
-   ├─ capture.py           系统声音采集 + Silero 切句
-   ├─ vad.py               Silero VAD（ONNX）
-   ├─ asr_stream.py        流式 Paraformer 识别
+   ├─ capture.py           系统声音采集（100ms 分块，不切句）
+   ├─ vad.py               Silero VAD（只用于人声概率/静音监测，不参与切句）
+   ├─ asr_stream.py        常驻流的在线识别 + 官方端点检测（切句）
    ├─ streaming.py         LocalAgreement 增量定稿
    ├─ transworker.py       翻译工作线程（与 ASR 解耦，不阻塞采集）
    ├─ context.py           翻译上下文（最近几句原文+译文，有界 + 场景重置）
@@ -317,13 +338,13 @@ Stark Industries = 斯塔克工业
 
 | 脚本 | 用途 |
 |---|---|
-| `test_vad.py` | 离线切句单测（不依赖声卡）：BGM / 小声场景下的段数与段长 |
-| `test_streaming.py` | 离线流式管道：音频 → 切句 → 流式识别 → 定稿，打印字幕时间线与回改次数 |
+| `test_vad.py` | Silero VAD / 采集监测：静音、真实语音、纯 BGM、没采到声音的提示 |
+| `test_streaming.py` | 离线流式链路：句首首词完整 / 句尾不吞词 / 不出现重复词 |
 | `test_pipeline.py` | P0 回归：投递非阻塞 / 原文译文配对 / 背压丢弃 / 一句一次翻译 |
 | `test_context.py` | P1 回归：上下文有界 / 双语历史 / 场景重置 / 术语表注入；含一个本地 mock 的 OpenAI 接口验证真实 LLM 路径 |
 | `test_glossary.py` | P2 回归：术语表有界注入 / 词边界 / 存读往返 / 版本号 / 语境缓存命中与失效 / 编辑窗口 |
 | `test_gui.py` | GUI 自测：字幕窗固定尺寸 + 端到端出字幕（并统计一句是否只翻译一次） |
-| `test_history.py` | 回看能力：最短停留 2.5s / 排队不丢字幕 / 历史只记成句 / 历史窗口 / 超长句先等停顿再硬切 |
+| `test_history.py` | 回看能力：最短停留 2.5s / 排队不丢字幕 / 历史只记成句 / 历史窗口 / 超长句硬上限 |
 | `diag_translate.py` | **翻译质量诊断**：跑一遍真实管道，先打印原文（看是不是识别就错了），再用各引擎分别翻译同一句做对比 |
 | `make_test_wav.py` | 用 TTS 生成多句测试音频 |
 
